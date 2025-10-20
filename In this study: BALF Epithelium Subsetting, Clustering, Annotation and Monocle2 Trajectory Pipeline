@@ -1,0 +1,461 @@
+# BALF Epithelium Subsetting, Clustering, Annotation and Monocle2 Trajectory Pipeline
+# Purpose:
+#   1) Subset Epithelium cells from a Seurat object and re-cluster
+#   2) Annotate epithelial subtypes with marker checks
+#   3) Visualize proportions and save results
+#   4) Build Monocle2 trajectory for macrophage example (adjust to your target celltype)
+# Requirements: Seurat, ggplot2, tidyverse, SingleR, celldex, RColorBrewer, SingleCellExperiment,
+#               dplyr, patchwork, ggsci, cowplot, paletteer, DT, gplots, monocle, Biobase,
+#               viridis, pheatmap, ggridges, aplot, reshape2, scales
+
+rm(list = ls())
+options(stringsAsFactors = FALSE)
+# Use an English path for portability; update to your own directory
+setwd("D:/BALF/Epithelium")
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(ggplot2)
+  library(tidyverse)
+  library(SingleR)
+  library(celldex)
+  library(RColorBrewer)
+  library(SingleCellExperiment)
+  library(dplyr)
+  library(patchwork)
+  library(ggsci)
+  library(cowplot)
+  library(paletteer)
+  library(data.table)
+  library(DT)
+  library(gplots)
+  library(tidyr)
+  library(reshape2)
+  library(scales)
+  library(viridis)
+  library(pheatmap)
+  library(ggpubr)
+  library(ggridges)
+  library(aplot)
+  library(Biobase)
+})
+
+# -------------------------------
+# 1) Load Seurat object and subset Epithelium
+# -------------------------------
+input_rdata <- 'E:/BALF/first_sce.Rdata'
+if (!file.exists(input_rdata)) stop(sprintf("Input file not found: %s", input_rdata))
+load(file = input_rdata) # loads 'sce'
+if (!exists("sce")) stop("Object 'sce' not found after loading.")
+
+# Basic checks
+if (!("celltype" %in% colnames(sce@meta.data))) stop("sce@meta.data$celltype not found. Please ensure celltype annotation is present.")
+print(table(sce@meta.data$patients))
+print(table(sce@meta.data$cell.orig))
+print(table(sce$celltype))
+
+# Subset Epithelium
+Epithelium <- sce[, sce$celltype %in% c("Epithelium")]
+if (ncol(Epithelium) == 0) stop("No Epithelium cells found. Check sce$celltype values.")
+
+DefaultAssay(Epithelium) <- "RNA"
+Epithelium <- NormalizeData(Epithelium, normalization.method = "LogNormalize")
+Epithelium <- FindVariableFeatures(Epithelium, selection.method = "vst", nfeatures = 3000)
+Epithelium <- ScaleData(Epithelium)
+Epithelium <- RunPCA(Epithelium, features = VariableFeatures(Epithelium))
+DimHeatmap(Epithelium, dims = 1:15, cells = 500, balanced = TRUE)
+Epithelium <- FindNeighbors(Epithelium, dims = 1:10)
+Epithelium <- FindClusters(Epithelium, resolution = 0.4)
+Epithelium <- RunUMAP(Epithelium, dims = 1:10, do.fast = TRUE, check_duplicates = FALSE)
+DimPlot(Epithelium, reduction = "umap", label = TRUE, group.by = "seurat_clusters", raster = FALSE)
+
+# Optionally remove undesired clusters by ID (adjust IDs to your data)
+clusters_to_remove <- c("3","4")
+Epithelium <- subset(Epithelium, idents = setdiff(levels(Idents(Epithelium)), clusters_to_remove))
+table(Idents(Epithelium))
+
+# Re-run normalization and clustering after subset
+DefaultAssay(Epithelium) <- "RNA"
+Epithelium <- NormalizeData(Epithelium)
+Epithelium <- FindVariableFeatures(Epithelium, selection.method = "vst", nfeatures = 3000)
+Epithelium <- ScaleData(Epithelium)
+Epithelium <- RunPCA(Epithelium, features = VariableFeatures(Epithelium))
+DimHeatmap(Epithelium, dims = 1:15, cells = 500, balanced = TRUE)
+Epithelium <- FindNeighbors(Epithelium, dims = 1:10)
+Epithelium <- FindClusters(Epithelium, resolution = 0.4)
+Epithelium <- RunUMAP(Epithelium, dims = 1:10, do.fast = TRUE, check_duplicates = FALSE)
+DimPlot(Epithelium, reduction = "umap", label = TRUE, group.by = "seurat_clusters", raster = FALSE)
+
+# -------------------------------
+# 2) Marker checks and feature visualization
+# -------------------------------
+Idents(Epithelium) <- "seurat_clusters"
+genes_to_check <- c("SCGB1A1","MUC5B","MUC5AC","FOXJ1","TP73","CCDC78","KRT17")
+p_dot <- DotPlot(Epithelium, features = genes_to_check) + coord_flip()
+print(p_dot)
+
+FeaturePlot(Epithelium, reduction = "umap", features = c("AGER","CLIC5","CAV1"))    # AT1 markers
+FeaturePlot(Epithelium, reduction = "umap", features = c("SFTPD","MUC5AC"))         # AT2/goblet
+FeaturePlot(Epithelium, reduction = "umap", features = c("FOXJ1","TP73","CCDC78"))  # Ciliated
+FeaturePlot(Epithelium, reduction = "umap", features = c("SCGB1A1","SCGB3A2","SOX2","SOX9")) # Club/Progenitor hints
+FeaturePlot(Epithelium, reduction = "umap", features = c("MUC5B","SPDEF"))          # Goblet
+FeaturePlot(Epithelium, reduction = "umap", features = c("FOXI1"))                  # Ionocyte
+FeaturePlot(Epithelium, reduction = "umap", features = c("RNASE1","KRT15","KRT5","S100A2","MUC16","TP63","KRT17"))
+
+# -------------------------------
+# 3) Differential markers within Epithelium
+# -------------------------------
+sce.markers <- FindAllMarkers(object = Epithelium, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+DT::datatable(sce.markers)
+write.csv(sce.markers, file = 'Epithelium_celltype_markers.csv', row.names = FALSE)
+DimPlot(Epithelium, reduction = "umap", label = TRUE)
+
+# -------------------------------
+# 4) Manual relabeling of epithelial clusters
+# -------------------------------
+# Adjust mapping to match your actual cluster IDs
+relabel_map <- c(
+  "0" = "mucus",
+  "1" = "mucus",
+  "2" = "ciliated",
+  "3" = "mucus",
+  "4" = "ciliated",
+  "5" = "ciliated",
+  "6" = "ciliated",
+  "7" = "KRT17_cell",
+  "8" = "mucus",
+  "9" = "mucus",
+  "10" = "ciliated"
+)
+missing_ids <- setdiff(names(relabel_map), as.character(sort(unique(Epithelium$seurat_clusters))))
+if (length(missing_ids) > 0) warning(sprintf("Cluster IDs not present and will be ignored: %s", paste(missing_ids, collapse = ", ")))
+Epithelium <- RenameIdents(Epithelium, relabel_map)
+Epithelium$celltype2 <- Epithelium@active.ident
+DimPlot(Epithelium, reduction = "umap", group.by = "celltype2")
+save(Epithelium, file = "Epithelium.Rdata")
+
+if ("patients" %in% colnames(Epithelium@meta.data)) {
+  print(table(Epithelium$patients, Epithelium$celltype2))
+}
+
+# -------------------------------
+# 5) Proportion visualization (example with manual counts)
+# -------------------------------
+# Prefer deriving counts from the object rather than hardcoding. Example:
+if ("patients" %in% colnames(Epithelium@meta.data)) {
+  prop_df <- as.data.frame(prop.table(table(Epithelium$celltype2, Epithelium$patients), margin = 2))
+  colnames(prop_df) <- c("celltype","patients","proportion")
+  gg_prop <- ggplot(prop_df, aes(x = patients, y = proportion, fill = celltype)) +
+    geom_bar(stat = "identity", position = "fill", color = "black") +
+    scale_y_continuous(labels = scales::percent) +
+    labs(x = "Timepoint", y = "Cell proportion", fill = "Celltype") +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 16),
+      axis.text.x = element_text(size = 12),
+      axis.text.y = element_text(size = 10),
+      legend.title = element_text(size = 12),
+      legend.text = element_text(size = 10),
+      panel.grid = element_blank(),
+      axis.line = element_line(color = "black")
+    )
+  print(gg_prop)
+  ggsave("Epithelium_celltype_proportions_by_patients.pdf", gg_prop, width = 6, height = 4)
+} else {
+  # Fallback: manual counts (adjust to your real samples)
+  cell_counts <- data.frame(
+    patients = c("BALF1", "BALF2"),
+    mucus = c(735, 582),
+    ciliated = c(215, 536),
+    KRT17_cell = c(5, 91)
+  )
+  cell_counts_long <- pivot_longer(cell_counts, cols = -patients, names_to = "celltype", values_to = "count") %>%
+    group_by(patients) %>% mutate(proportion = count / sum(count))
+  gg_prop <- ggplot(cell_counts_long, aes(x = patients, y = proportion, fill = celltype)) +
+    geom_bar(stat = "identity", position = "fill", color = "black") +
+    scale_y_continuous(labels = scales::percent) +
+    labs(x = "Timepoint", y = "Cell proportion", fill = "Celltype") +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 16),
+      axis.text.x = element_text(size = 12),
+      axis.text.y = element_text(size = 10),
+      legend.title = element_text(size = 12),
+      legend.text = element_text(size = 10),
+      panel.grid = element_blank(),
+      axis.line = element_line(color = "black")
+    )
+  print(gg_prop)
+  ggsave("Epithelium_celltype_proportions_manual.pdf", gg_prop, width = 6, height = 4)
+}
+
+# -------------------------------
+# 6) Monocle2 trajectory (example pipeline; adjust to your cell type and metadata)
+# -------------------------------
+# This section uses 'allcell' and builds a macrophage trajectory; adapt objects/columns accordingly.
+# Ensure 'allcell' exists before proceeding
+if (exists("allcell")) {
+  suppressPackageStartupMessages({
+    library(monocle)
+  })
+  # Subset macrophage cells (adjust column name and values to match your data)
+  if (!("celltype3" %in% colnames(allcell@meta.data))) stop("allcell@meta.data$celltype3 not found.")
+  mac <- allcell[, allcell@meta.data$celltype3 %in% c("macrophage")]
+  if (ncol(mac) == 0) stop("No macrophage cells found in 'allcell'.")
+  # Combine group and celltype2 to a composite grouping (ensure columns exist)
+  req_cols <- c("group","celltype2")
+  if (!all(req_cols %in% colnames(mac@meta.data))) stop("Columns 'group' and/or 'celltype2' not found in mac@meta.data.")
+  mac$group_celltype <- paste0(mac$group, "_", mac$celltype2)
+  Idents(mac) <- "group_celltype"
+  
+  # Build Monocle2 CDS
+  data_mtx <- as(mac@assays$RNA@counts, 'sparseMatrix')
+  pd <- new('AnnotatedDataFrame', data = mac@meta.data)
+  fData <- data.frame(gene_short_name = row.names(data_mtx), row.names = row.names(data_mtx))
+  fd <- new('AnnotatedDataFrame', data = fData)
+  monocle_cds <- newCellDataSet(data_mtx,
+                                phenoData = pd,
+                                featureData = fd,
+                                lowerDetectionLimit = 0.5,
+                                expressionFamily = negbinomial.size())
+  HSMM <- monocle_cds
+  HSMM <- estimateSizeFactors(HSMM)
+  save(HSMM, file = "estimateSizeFactors(HSMM).Rdata")
+  save(mac, file = "mac_for_Monocle2.Rdata")
+  
+  # These steps can be memory intensive
+  HSMM <- estimateDispersions(HSMM)
+  HSMM <- detectGenes(HSMM, min_expr = 3)
+  expressed_genes <- row.names(subset(fData(HSMM), num_cells_expressed >= 10))
+  
+  # Select ordering genes: use DE genes across clusters in Seurat
+  deg.cluster <- FindAllMarkers(mac, only.pos = TRUE)
+  express_genes <- subset(deg.cluster, p_val_adj < 0.05)$gene
+  HSMM <- setOrderingFilter(HSMM, express_genes)
+  plot_ordering_genes(HSMM)
+  
+  # Differential genes by grouping for trajectory
+  diff <- differentialGeneTest(HSMM[expressed_genes,], fullModelFormulaStr = "~group_celltype", cores = 1)
+  deg <- subset(diff, qval < 0.01)
+  deg <- deg[order(deg$qval, decreasing = FALSE),]
+  write.table(deg, file = "mac_train.monocle.DEG.xls", col.names = TRUE, row.names = FALSE, sep = "\t", quote = FALSE)
+  
+  # Set ordering filter with top DEG
+  ordergene <- rownames(deg)
+  HSMM <- setOrderingFilter(HSMM, ordergene)
+  pdf("train.ordergenes.pdf"); plot_ordering_genes(HSMM); dev.off()
+  
+  cds <- reduceDimension(HSMM, max_components = 2, method = 'DDRTree')
+  cds <- orderCells(cds)
+  save(cds, data_mtx, deg, deg.cluster, diff, fd, HSMM, monocle_cds, pd, express_genes, expressed_genes, ordergene, file = "monocle2_after_orderCells.Rdata")
+  
+  # Trajectory plots
+  pdf("monocle.pseudotime1.pdf", width = 7, height = 7); plot_cell_trajectory(cds, color_by = "Pseudotime", size = 1, show_backbone = TRUE); dev.off()
+  if ("group" %in% colnames(pData(cds))) { pdf("monocle.pseudotime_by_group.pdf", width = 7, height = 7); plot_cell_trajectory(cds, color_by = "group", size = 1, show_backbone = TRUE); dev.off() }
+  if ("celltype_subset" %in% colnames(pData(cds))) { pdf("monocle.pseudotime_by_celltype_subset.pdf", width = 7, height = 7); plot_cell_trajectory(cds, color_by = "celltype_subset", size = 1, show_backbone = TRUE); dev.off() }
+  pdf("monocle.state.pdf", width = 7, height = 7); plot_cell_trajectory(cds, color_by = "State", size = 1, show_backbone = TRUE); dev.off()
+  pdf("seurat.clusters_on_trajectory.pdf", width = 7, height = 7); plot_cell_trajectory(cds, color_by = "seurat_clusters"); dev.off()
+  
+  # Combined plots
+  mycolors <- c(brewer.pal(name="Dark2", n = 8), brewer.pal(name="Paired", n = 6))
+  p1 <- plot_cell_trajectory(cds, color_by = "celltype_subset")
+  p2 <- plot_cell_trajectory(cds, color_by = "State")
+  p3 <- plot_cell_trajectory(cds, color_by = "group")
+  p4 <- plot_cell_trajectory(cds, color_by = "Pseudotime", size = 1, show_backbone = TRUE)
+  print(p1 | p2 | p3 | p4)
+  
+  # State proportion pies
+  df <- pData(cds)
+  colourCount <- length(unique(df$State))
+  getPalette <- colorRampPalette(brewer.pal(5, "Set1"))
+  state_colors <- getPalette(colourCount)
+  plotC <- table(df$State, df$group) %>% melt()
+  colnames(plotC) <- c("State", "group","Number")
+  plotC <- plotC %>% group_by(group) %>% mutate(Proportion = Number / sum(Number))
+  mediterranean_colors <- c("#2A9D8F", "#E9C46A", "#F4A261", "#264653", "#E76F51", "#A8DADC", "#457B9D")
+  p_pie <- ggplot(plotC, aes(x = "", y = Proportion, fill = State)) +
+    geom_bar(width = 1, stat = "identity") +
+    coord_polar(theta = "y") +
+    facet_wrap(~ group) +
+    theme_void() +
+    labs(fill = "state proportion") +
+    scale_fill_manual(values = mediterranean_colors)
+  print(p_pie)
+  
+  # Save state-2 cells
+  pdata <- Biobase::pData(cds)
+  s.cells <- subset(pdata, State == "2") %>% rownames()
+  save(s.cells, file = "Monocle_state2.rda")
+  write.csv(pData(cds), "pseudotime.csv")
+  save(cds, file = "cds.rda")
+  
+  # Key genes over pseudotime
+  keygenes <- head(ordergene, 5)
+  cds_subset <- cds[keygenes,]
+  pA <- plot_genes_in_pseudotime(cds_subset, color_by = "State")
+  pB <- plot_genes_in_pseudotime(cds_subset, color_by = "celltype_subset")
+  pC <- plot_genes_in_pseudotime(cds_subset, color_by = "group")
+  plotc <- pA | pB | pC
+  ggsave("Genes_pseudotimeplot.pdf", plot = plotc, width = 16, height = 8)
+  
+  # Jitter/violin/pseudotime for selected genes
+  s.genes <- c("S100A8","CXCR4","CD74","CD69","EBF1","IFITM3","TCL1A","BACH2","HLA-DRA","TNFRSF13C")
+  pJ <- plot_genes_jitter(cds[s.genes,], grouping = "State", color_by = "celltype_subset")
+  pV <- plot_genes_violin(cds[s.genes,], grouping = "celltype_subset", color_by = "group")
+  pT <- plot_genes_in_pseudotime(cds[s.genes,], color_by = "State")
+  ggsave("Genes_Jitterplot_all.pdf", plot = (pJ | pV | pT), width = 16, height = 8)
+  ggsave("Genes_Jitterplot.pdf", plot = pJ, width = 4, height = 7)
+  ggsave("plot_genes_violin.pdf", plot = pV, width = 4, height = 7)
+  ggsave("plot_genes_in_pseudotime.pdf", plot = pT, width = 4, height = 7)
+  
+  # Pseudotime-dependent genes (Monocle2)
+  cds_DGT_pseudotimegenes <- differentialGeneTest(cds, fullModelFormulaStr = "~sm.ns(Pseudotime)")
+  cds_DGT_pseudotimegenes_sig <- subset(cds_DGT_pseudotimegenes, qval < 0.01)
+  save(cds, cds_subset, mac, cds_DGT_pseudotimegenes, HSMM, monocle_cds, file = "monocle_raw_files_for_pseudotime.Rdata")
+  
+  # Combine with Seurat marker top genes
+  # Ensure B_cell_sce exists if you plan to use it; otherwise skip
+  if (exists("B_cell_sce")) {
+    Idents(B_cell_sce) <- "group_celltype"
+    marker <- FindAllMarkers(B_cell_sce, only.pos = TRUE, logfc.threshold = 0.5)
+    marker <- marker[marker$p_val_adj < 0.05,]
+    top15 <- marker %>% group_by(cluster) %>% slice_max(order_by = avg_log2FC, n = 100)
+    top15_ordergene <- cds_DGT_pseudotimegenes_sig[top15$gene, ]
+    write.csv(top15_ordergene, "筛选top15_ordergene.csv", row.names = FALSE)
+    top15_ordergene <- read.csv("筛选top15_ordergene.csv")
+  }
+  
+  # Build pseudotime heatmap
+  Time_genes <- unique(cds_DGT_pseudotimegenes_sig$gene_short_name)
+  Time_genes <- Time_genes[Time_genes %in% rownames(cds)]
+  pdf("拟时序分析热图.pdf", width = 5, height = 10)
+  plot_pseudotime_heatmap(cds[Time_genes,],
+                          num_cluster = 3,
+                          show_rownames = TRUE,
+                          return_heatmap = TRUE,
+                          hmcols = colorRampPalette(c("navy","white","firebrick3"))(100))
+  dev.off()
+  p <- plot_pseudotime_heatmap(cds[Time_genes,], num_cluster = 7, show_rownames = TRUE, return_heatmap = TRUE,
+                               hmcols = colorRampPalette(rev(brewer.pal(9, "PRGn")))(100))
+  print(p)
+  p <- plot_pseudotime_heatmap(cds[Time_genes,], num_cluster = 7, show_rownames = TRUE, return_heatmap = FALSE, hmcols = viridis(256))
+  print(p)
+  
+  # Extract smoothed expression for custom heatmaps
+  cds_subset2 <- cds
+  newdata <- data.frame(Pseudotime = seq(min(pData(cds_subset2)$Pseudotime), max(pData(cds_subset2)$Pseudotime), length.out = 100))
+  m <- genSmoothCurves(cds[Time_genes,], trend_formula = '~sm.ns(Pseudotime, df=3)', relative_expr = TRUE, new_data = newdata)
+  m <- m[!apply(m, 1, sum) == 0,]
+  m <- log10(m + 1)
+  m <- m[!apply(m, 1, sd) == 0,]
+  m <- Matrix::t(scale(Matrix::t(m), center = TRUE))
+  m[m > 3] <- 3
+  m[m < -3] <- -3
+  
+  callback <- function(hc, mat) {
+    sv <- svd(t(mat))$v[,1]
+    dend <- reorder(as.dendrogram(hc), wts = sv)
+    as.hclust(dend)
+  }
+  p1 <- pheatmap(m,
+                 useRaster = TRUE,
+                 cluster_cols = FALSE,
+                 cluster_rows = TRUE,
+                 show_rownames = TRUE,
+                 show_colnames = FALSE,
+                 clustering_method = "ward.D2",
+                 cutree_rows = 4,
+                 filename = NA,
+                 border_color = NA,
+                 fontsize_row = 8,
+                 color = colorRampPalette(c("navy","white","firebrick3"))(100),
+                 clustering_callback = callback)
+  
+  annotation_col <- data.frame(pseudotime = scales::rescale(newdata$Pseudotime, to = c(-1, 1)))
+  row.names(annotation_col) <- colnames(m)
+  annotation_row <- data.frame(Cluster = factor(cutree(p1$tree_row, 4)))
+  row.names(annotation_row) <- rownames(m)
+  rowcolor <- c("#85B22E","#E29827","#922927","#57C3F3")
+  names(rowcolor) <- c("1","2","3","4")
+  ann_colors <- list(pseudotime = viridis(100), Cluster = rowcolor)
+  
+  p2 <- pheatmap(m,
+                 useRaster = TRUE,
+                 cluster_cols = FALSE,
+                 cluster_rows = TRUE,
+                 show_rownames = TRUE,
+                 show_colnames = FALSE,
+                 clustering_method = "ward.D2",
+                 cutree_rows = 4,
+                 filename = NA,
+                 border_color = NA,
+                 fontsize_row = 8,
+                 color = viridis(100),
+                 annotation_col = annotation_col,
+                 annotation_colors = ann_colors,
+                 annotation_row = annotation_row,
+                 clustering_callback = callback,
+                 annotation_names_col = FALSE,
+                 annotation_names_row = FALSE,
+                 main = "Pseudotime")
+  print(p2)
+  
+  # ggplot recreation heatmap
+  heat_gg <- as.data.frame(m) %>% mutate(gene = row.names(.)) %>% melt()
+  p3 <- ggplot(heat_gg, aes(x = variable, y = gene, fill = value)) +
+    geom_raster() +
+    scale_fill_gradient2(low = "#003366", high = "#990033", mid = "white", name = "Pseudotime") +
+    theme(axis.title = element_blank(),
+          panel.grid = element_blank(),
+          axis.ticks = element_blank(),
+          axis.text.x = element_blank(),
+          axis.text.y = element_text(colour = 'black', size = 8)) +
+    scale_y_discrete(position = "right")
+  print(p3)
+  
+  # Ridge plots by group_celltype
+  plotdf <- pData(cds)
+  if ("group_celltype" %in% colnames(plotdf)) {
+    gg1 <- ggplot(plotdf, aes(x = Pseudotime, y = group_celltype, fill = group_celltype)) +
+      geom_density_ridges(scale = 1) +
+      theme_minimal() +
+      theme(panel.grid = element_blank(),
+            axis.title = element_blank(),
+            axis.text = element_text(colour = 'black', size = 8),
+            axis.ticks.x = element_line(color = 'black', size = 0.5),
+            axis.ticks.length.x = unit(0.1, "cm")) +
+      guides(fill = FALSE)
+    print(gg1)
+  }
+  
+  # Scatter of selected genes over pseudotime by group_celltype
+  genes <- c("PRDM1", "MKI67","IGHG1","E2F8","GZMK","MTLN")
+  exprs_mtx <- exprs(cds)
+  genes <- genes[genes %in% rownames(exprs_mtx)]
+  genes_exp <- lapply(genes, function(g) as.data.frame(log2(exprs_mtx[g,] + 1)))
+  gene_exp <- do.call(cbind, genes_exp); colnames(gene_exp) <- genes
+  pData(cds) <- cbind(pData(cds), gene_exp)
+  data_plot <- pData(cds) %>% dplyr::select("group_celltype","Pseudotime", all_of(genes))
+  
+  plist <- list()
+  for (feat in genes) {
+    df <- data_plot %>% dplyr::select(group_celltype, Pseudotime, !!feat)
+    colnames(df) <- c("group_celltype","Pseudotime","gene")
+    p <- ggplot(df, aes(x = Pseudotime, y = gene)) +
+      geom_point(aes(color = group_celltype), size = 0.8) +
+      geom_smooth(method = "loess", formula = y ~ x, color = 'black', se = FALSE) +
+      theme(panel.grid.major = element_blank(),
+            panel.grid.minor = element_blank(),
+            panel.border = element_blank(),
+            panel.background = element_blank(),
+            axis.line = element_line(colour = "black", size = 1),
+            axis.title = element_blank(),
+            axis.text  = element_text(size = 12, colour = 'black'),
+            legend.position = 'none') +
+      ggtitle(feat)
+    plist[[length(plist) + 1]] <- p
+  }
+  print(wrap_plots(plist, ncol = 2))
+} else {
+  warning("Object 'allcell' not found. Monocle2 section skipped.")
+}
