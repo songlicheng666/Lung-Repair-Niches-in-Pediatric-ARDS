@@ -1,0 +1,212 @@
+# BALF Macrophage Subsetting, Clustering, Annotation and Visualization Pipeline
+# Purpose:
+#   - Subset macrophages, re-cluster, visualize markers
+#   - Remove undesired cluster(s) and re-run standard workflow
+#   - Manual annotation of macrophage subtypes
+#   - Visualize cell-type proportions by patients
+#   - Export differential gene lists
+# Requirements: Seurat, ggplot2, tidyverse, dplyr, patchwork, DT, RColorBrewer
+
+rm(list = ls())
+options(stringsAsFactors = FALSE)
+setwd("D:/BALF/Macrophage")
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(ggplot2)
+  library(tidyverse)
+  library(dplyr)
+  library(patchwork)
+  library(cowplot)
+  library(DT)
+  library(RColorBrewer)
+  library(tidyr)
+  library(scales)
+})
+
+# -------------------------------
+# 1) Load Seurat object
+# -------------------------------
+input_rdata <- 'E:/BALF/first_sce.Rdata'
+if (!file.exists(input_rdata)) stop(sprintf("Input file not found: %s", input_rdata))
+load(file = input_rdata) # loads 'sce'
+if (!exists("sce")) stop("Object 'sce' not found after loading.")
+
+# Checks
+if (!("celltype" %in% colnames(sce@meta.data))) stop("sce@meta.data$celltype not found.")
+if (!("patients" %in% colnames(sce@meta.data))) {
+  warning("sce@meta.data$patients not found. Some group-wise plots will be skipped. Please add 'patients' if needed.")
+}
+print(table(sce@meta.data$patients))
+print(table(sce@meta.data$cell.orig))
+print(table(sce$celltype))
+
+# -------------------------------
+# 2) Subset macrophages and standard workflow
+# -------------------------------
+MAC <- sce[, sce$celltype %in% c("macrophage")]
+if (ncol(MAC) == 0) stop("No macrophage cells found in sce.")
+
+DefaultAssay(MAC) <- "RNA"
+MAC <- NormalizeData(MAC, normalization.method = "LogNormalize")
+MAC <- FindVariableFeatures(MAC, selection.method = "vst", nfeatures = 3000)
+MAC <- ScaleData(MAC)
+MAC <- RunPCA(MAC, features = VariableFeatures(MAC))
+DimHeatmap(MAC, dims = 1:15, cells = 500, balanced = TRUE)
+MAC <- FindNeighbors(MAC, dims = 1:10)
+MAC <- FindClusters(MAC, resolution = 0.4)
+MAC <- RunUMAP(MAC, dims = 1:10, do.fast = TRUE, check_duplicates = FALSE)
+DimPlot(MAC, reduction = "umap", label = TRUE, group.by = "seurat_clusters", raster = FALSE)
+Idents(MAC) <- "seurat_clusters"
+print(table(Idents(MAC)))
+
+# -------------------------------
+# 3) Inspect cluster 9 markers and remove cluster 9 (adjust if needed)
+# -------------------------------
+if ("9" %in% levels(Idents(MAC))) {
+  cluster9_markers <- FindMarkers(MAC, ident.1 = "9", min.pct = 0.25, logfc.threshold = 0.25)
+  top30_genes_cluster9 <- head(cluster9_markers[order(cluster9_markers$avg_log2FC, decreasing = TRUE), ], 30)
+  print(head(top30_genes_cluster9))
+  
+  MAC_filtered <- subset(MAC, idents = setdiff(levels(Idents(MAC)), "9"))
+} else {
+  warning("Cluster '9' not present. Skipping removal.")
+  MAC_filtered <- MAC
+}
+print(table(Idents(MAC_filtered)))
+
+# -------------------------------
+# 4) Re-run workflow after filtering
+# -------------------------------
+DefaultAssay(MAC_filtered) <- "RNA"
+MAC_filtered <- NormalizeData(MAC_filtered)
+MAC_filtered <- FindVariableFeatures(MAC_filtered, selection.method = "vst", nfeatures = 3000)
+MAC_filtered <- ScaleData(MAC_filtered)
+MAC_filtered <- RunPCA(MAC_filtered, features = VariableFeatures(MAC_filtered))
+DimHeatmap(MAC_filtered, dims = 1:15, cells = 500, balanced = TRUE)
+MAC_filtered <- FindNeighbors(MAC_filtered, dims = 1:10)
+MAC_filtered <- FindClusters(MAC_filtered, resolution = 0.4)
+MAC_filtered <- RunUMAP(MAC_filtered, dims = 1:10, do.fast = TRUE, check_duplicates = FALSE)
+DimPlot(MAC_filtered, reduction = "umap", label = TRUE, group.by = "seurat_clusters", raster = FALSE)
+
+# -------------------------------
+# 5) Marker panels
+# -------------------------------
+Idents(MAC_filtered) <- "seurat_clusters"
+genes_to_check <- c("MARCO","FABP4","INHBA","FCN1","CD14","IL1B","PLA2G7","LGMN",
+                    "SPP1","MMP9","HAMP","MERTK","FOLR2","CCL13","F13A1","MKI67","TROAP","PCNA","GNLY")
+p_dot <- DotPlot(MAC_filtered, features = genes_to_check) + coord_flip()
+print(p_dot)
+FeaturePlot(MAC_filtered, reduction = "umap", features = c("FABP4","INHBA","FCN1","CD14","FOLR2","CCL13","LGMN","MKI67","TROAP","PCNA","SPP1","PLA2G7","MMP9","GNLY"), pt.size = 0.5)
+
+# -------------------------------
+# 6) Save filtered object and compute markers
+# -------------------------------
+MAC <- MAC_filtered
+sce.markers <- FindAllMarkers(object = MAC, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+DT::datatable(sce.markers)
+write.csv(sce.markers, file = 'first_MAC.markers.csv', row.names = FALSE)
+DimPlot(MAC, reduction = "umap", label = TRUE, raster = FALSE)
+DimPlot(MAC, label = TRUE, raster = FALSE) + NoLegend()
+
+# -------------------------------
+# 7) Manual relabeling (adjust IDs to your data)
+# -------------------------------
+new.cluster.ids <- c(
+  "0" = "FABP4.MAC",
+  "1" = "FCN1.MAC",
+  "2" = "FABP4.MAC",
+  "3" = "FABP4.MAC",
+  "4" = "FABP4.MAC",
+  "5" = "FABP4.MAC",
+  "6" = "FCN1.MAC",
+  "7" = "FCN1.MAC",
+  "8" = "FCN1.MAC",
+  "9" = "SPP1.MAC"
+)
+missing_ids <- setdiff(names(new.cluster.ids), as.character(sort(unique(MAC$seurat_clusters))))
+if (length(missing_ids) > 0) warning(sprintf("Cluster IDs not present and will be ignored: %s", paste(missing_ids, collapse = ", ")))
+MAC <- RenameIdents(MAC, new.cluster.ids)
+MAC$celltype2 <- MAC@active.ident
+DimPlot(MAC, reduction = "umap", group.by = "celltype2")
+save(MAC, file = "MAC.Rdata")
+
+# -------------------------------
+# 8) Proportions by patients
+# -------------------------------
+if ("patients" %in% colnames(MAC@meta.data)) {
+  prop_df <- as.data.frame(prop.table(table(MAC$celltype2, MAC$patients), margin = 2))
+  colnames(prop_df) <- c("celltype","patients","proportion")
+  gg_prop <- ggplot(prop_df, aes(x = patients, y = proportion, fill = celltype)) +
+    geom_bar(stat = "identity", position = "fill", color = "black") +
+    scale_y_continuous(labels = scales::percent) +
+    labs(x = "Time point", y = "Cell proportion", fill = "Celltype") +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 16),
+      axis.text.x = element_text(size = 12),
+      axis.text.y = element_text(size = 10),
+      legend.title = element_text(size = 12),
+      legend.text = element_text(size = 10),
+      panel.grid = element_blank(),
+      axis.line = element_line(color = "black")
+    )
+  print(gg_prop)
+  ggsave("MAC_celltype_proportions_by_patients.pdf", gg_prop, width = 6, height = 4)
+} else {
+  # Fallback: manual counts (ensure realistic numbers; your example seems extremely imbalanced)
+  cell_counts <- data.frame(
+    patients = c("BALF1", "BALF2"),
+    FABP4_MAC = c(15, 18032),
+    FCN1_MAC = c(3847, 6964),
+    SPP1_MAC = c(22, 523)
+  )
+  cell_counts_long <- pivot_longer(cell_counts, cols = -patients, names_to = "celltype", values_to = "count") %>%
+    group_by(patients) %>% mutate(proportion = count / sum(count))
+  gg_prop <- ggplot(cell_counts_long, aes(x = patients, y = proportion, fill = celltype)) +
+    geom_bar(stat = "identity", position = "fill", color = "black") +
+    scale_y_continuous(labels = scales::percent) +
+    labs(x = "Time point", y = "Cell proportion", fill = "Celltype") +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 16),
+      axis.text.x = element_text(size = 12),
+      axis.text.y = element_text(size = 10),
+      legend.title = element_text(size = 12),
+      legend.text = element_text(size = 10),
+      panel.grid = element_blank(),
+      axis.line = element_line(color = "black")
+    )
+  print(gg_prop)
+  ggsave("MAC_celltype_proportions_manual.pdf", gg_prop, width = 6, height = 4)
+}
+
+# -------------------------------
+# 9) FeaturePlot split by patients
+# -------------------------------
+if ("patients" %in% colnames(MAC_filtered@meta.data)) {
+  DefaultAssay(MAC_filtered) <- "RNA"
+  p_spp1 <- FeaturePlot(object = MAC_filtered, features = "SPP1", split.by = "patients",
+                        cols = c("lightgrey", "blue"), reduction = "umap", pt.size = 0.5)
+  p_fcn1 <- FeaturePlot(object = MAC_filtered, features = "FCN1", split.by = "patients",
+                        cols = c("lightgrey", "blue"), reduction = "umap", pt.size = 0.5)
+  print(p_spp1); print(p_fcn1)
+  ggsave("FeaturePlot_SPP1_split_by_patients.pdf", p_spp1, width = 7, height = 5)
+  ggsave("FeaturePlot_FCN1_split_by_patients.pdf", p_fcn1, width = 7, height = 5)
+} else {
+  warning("Column 'patients' not found in MAC_filtered@meta.data. Split FeaturePlot skipped.")
+}
+
+# -------------------------------
+# 10) Differential expression export
+# -------------------------------
+Idents(MAC) <- "celltype2"
+DEG <- FindAllMarkers(
+  MAC,
+  logfc.threshold = 0.1,
+  test.use = "wilcox",
+  slot = "data",
+  min.pct = 0.01,
+  min.diff.pct = -Inf
+)
+write.csv(DEG, file = "MAC-DEG.csv", row.names = FALSE)
