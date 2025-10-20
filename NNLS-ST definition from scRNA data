@@ -1,0 +1,244 @@
+id: integrate_spatial_seurat_v5
+name: Integrated Spatial Seurat v5 Pipeline (English Only)
+type: code.r
+content: |-
+  # Dependencies
+  suppressPackageStartupMessages({
+    library(Seurat)
+    library(dplyr)
+  })
+
+  # Quick peek of objects
+  glimpse(LIVE)
+  glimpse(DEATH)
+  message("=== Merge spatial transcriptomics objects ===")
+
+  # Step 1: Inspect input objects
+  message("Pre-merge object overview:")
+  message(paste("LIVE: ", ncol(LIVE), "spots,", nrow(LIVE), "genes"))
+  message(paste("DEATH:", ncol(DEATH), "spots,", nrow(DEATH), "genes"))
+
+  # Check assay names
+  message("LIVE assays: ", paste(names(LIVE@assays), collapse = ", "))
+  message("DEATH assays:", paste(names(DEATH@assays), collapse = ", "))
+
+  # Step 2: Merge objects
+  message("Starting merge...")
+  Spatial_integrated <- merge(
+    x = LIVE,
+    y = DEATH,
+    add.cell.ids = c("LIVE", "DEATH"),
+    project = "Integrated_Spatial"
+  )
+
+  message("Merge complete.")
+  print(Spatial_integrated)
+
+  # Step 3: Validate merged object
+  message("=== Validate merged object ===")
+  message(paste("Total spots after merge:", ncol(Spatial_integrated)))
+  message(paste("Total genes after merge:", nrow(Spatial_integrated)))
+
+  # Sample distribution
+  message("Sample distribution:")
+  print(table(Spatial_integrated@meta.data$orig.ident))
+
+  # Assay check
+  message("Merged assays:")
+  for (assay_name in names(Spatial_integrated@assays)) {
+    assay_obj <- Spatial_integrated@assays[[assay_name]]
+    msg <- paste0(
+      assay_name, " : ", class(assay_obj),
+      " - genes: ", nrow(assay_obj),
+      " - cells: ", ncol(assay_obj)
+    )
+    message(msg)
+  }
+
+  # Images
+  message("Image keys:")
+  message(paste(names(Spatial_integrated@images), collapse = ", "))
+
+  # Metadata columns
+  message("Metadata columns:")
+  message(paste(colnames(Spatial_integrated@meta.data), collapse = ", "))
+
+  # Step 4: Clean and standardize merged object
+  message("=== Clean merged object ===")
+  if ("Spatial" %in% names(Spatial_integrated@assays)) {
+    DefaultAssay(Spatial_integrated) <- "Spatial"
+  } else {
+    warning("No 'Spatial' assay found. DefaultAssay unchanged.")
+  }
+
+  # Remove outdated clustering/graph/reduction info
+  message("Clearing clustering, neighbor graphs, and reductions...")
+  Spatial_integrated@graphs <- list()
+  Spatial_integrated@neighbors <- list()
+  Spatial_integrated@reductions <- list()
+
+  # Reset active ident to orig.ident if present
+  if ("orig.ident" %in% colnames(Spatial_integrated@meta.data)) {
+    Idents(Spatial_integrated) <- "orig.ident"
+  }
+
+  message("Clean-up complete.")
+
+  # Step 5: Re-normalization and feature selection (optional)
+  message("=== Re-normalization and variable feature selection ===")
+
+  # Normalize Spatial assay if needed
+  need_norm <- TRUE
+  if ("Spatial" %in% names(Spatial_integrated@assays)) {
+    has_data_layer <- "data" %in% names(Spatial_integrated[["Spatial"]]@layers)
+    if (has_data_layer) {
+      max_val <- suppressWarnings(
+        max(LayerData(Spatial_integrated, assay = "Spatial", layer = "data"))
+      )
+      need_norm <- is.na(max_val) || max_val <= 1
+    }
+  } else {
+    warning("Spatial assay not found; skipping Spatial normalization.")
+    need_norm <- FALSE
+  }
+
+  if (need_norm) {
+    message("Normalizing Spatial assay...")
+    Spatial_integrated <- NormalizeData(Spatial_integrated, assay = "Spatial")
+  }
+
+  # Variable features on Spatial
+  message("Finding variable features (Spatial)...")
+  Spatial_integrated <- FindVariableFeatures(
+    Spatial_integrated,
+    assay = "Spatial",
+    selection.method = "vst",
+    nfeatures = 3000
+  )
+  message(paste("Variable features (Spatial):", length(VariableFeatures(Spatial_integrated))))
+
+  # Check SCT assay variable features
+  if ("SCT" %in% names(Spatial_integrated@assays)) {
+    message("Checking SCT assay...")
+    sct_assay <- Spatial_integrated[["SCT"]]
+    sct_var_n <- length(sct_assay@var.features)
+    message(paste("SCT variable features:", sct_var_n))
+
+    if (sct_var_n == 0) {
+      message("Recomputing SCT variable features...")
+      DefaultAssay(Spatial_integrated) <- "SCT"
+      Spatial_integrated <- FindVariableFeatures(
+        Spatial_integrated,
+        assay = "SCT",
+        selection.method = "vst",
+        nfeatures = 3000
+      )
+      DefaultAssay(Spatial_integrated) <- "Spatial"
+    }
+  }
+
+  # Step 6: Data quality checks
+  message("=== Post-merge data quality checks ===")
+  if ("Spatial" %in% names(Spatial_integrated@assays)) {
+    Spatial_integrated <- JoinLayers(Spatial_integrated, assay = "Spatial")
+    spatial_data <- GetAssayData(Spatial_integrated, assay = "Spatial", slot = "data")
+    nz_prop <- round(sum(spatial_data > 0) / length(spatial_data) * 100, 2)
+    mean_expr <- round(mean(spatial_data), 4)
+    max_expr <- round(max(spatial_data), 4)
+    message("Spatial assay summary:")
+    message(paste("Non-zero proportion:", nz_prop, "%"))
+    message(paste("Mean expression:", mean_expr))
+    message(paste("Max expression:", max_expr))
+  } else {
+    warning("Spatial assay not found; skipping data summary.")
+  }
+
+  # Metadata integrity
+  message("Metadata integrity:")
+  meta_cols <- c("orig.ident", "nCount_Spatial", "nFeature_Spatial")
+  for (col in meta_cols) {
+    if (col %in% colnames(Spatial_integrated@meta.data)) {
+      na_count <- sum(is.na(Spatial_integrated@meta.data[[col]]))
+      message(paste(col, "- NA count:", na_count))
+    } else {
+      message(paste(col, "- missing"))
+    }
+  }
+
+  # Per-sample summary
+  message("Per-sample summary:")
+  if (all(c("orig.ident", "nCount_Spatial", "nFeature_Spatial") %in% colnames(Spatial_integrated@meta.data))) {
+    stats_summary <- Spatial_integrated@meta.data %>%
+      group_by(orig.ident) %>%
+      summarise(
+        n_spots = n(),
+        mean_nCount = round(mean(nCount_Spatial, na.rm = TRUE), 0),
+        mean_nFeature = round(mean(nFeature_Spatial, na.rm = TRUE), 0),
+        .groups = "drop"
+      )
+    print(stats_summary)
+  } else {
+    message("Required metadata columns missing; skipping per-sample summary.")
+  }
+
+  # Final object info
+  message("=== Final merged object ===")
+  print(Spatial_integrated)
+  message("✅ Merge finished.")
+
+  # Step 7: Prepare RNA assay for deconvolution (optional)
+  message("=== Prepare RNA assay for deconvolution ===")
+  if (!"RNA" %in% names(Spatial_integrated@assays) && "SCT" %in% names(Spatial_integrated@assays)) {
+    message("Creating RNA assay from SCT counts...")
+    sct_counts <- Spatial_integrated[["SCT"]]@counts
+
+    if (!is.null(sct_counts) && nrow(sct_counts) > 0 && ncol(sct_counts) > 0) {
+      Spatial_integrated[["RNA"]] <- CreateAssay5Object(counts = sct_counts)
+
+      DefaultAssay(Spatial_integrated) <- "RNA"
+      Spatial_integrated <- NormalizeData(Spatial_integrated, assay = "RNA")
+      Spatial_integrated <- FindVariableFeatures(
+        Spatial_integrated,
+        assay = "RNA",
+        selection.method = "vst",
+        nfeatures = 3000
+      )
+
+      message("✅ RNA assay created.")
+      print(Spatial_integrated[["RNA"]])
+
+      DefaultAssay(Spatial_integrated) <- "Spatial"
+    } else {
+      warning("SCT counts empty; RNA assay not created.")
+    }
+  } else if ("RNA" %in% names(Spatial_integrated@assays)) {
+    message("RNA assay already present; skipping creation.")
+  } else {
+    warning("SCT assay not found; cannot create RNA assay.")
+  }
+
+  message("=== All steps completed ===")
+  message("You can now proceed with downstream analyses using Spatial_integrated.")
+
+  # Downstream example (ensure these resources exist)
+  # Note: 'total_sce', 'celltypeprops' assay, and feature 'AT1' must exist to run.
+  if (exists("total_sce") && "celltype2" %in% colnames(total_sce@colData)) {
+    print(table(total_sce$celltype2))
+  } else {
+    message("Skipping total_sce celltype2 table: object or column missing.")
+  }
+
+  if ("celltypeprops" %in% names(Spatial_integrated@assays)) {
+    DefaultAssay(Spatial_integrated) <- "celltypeprops"
+    if ("AT1" %in% rownames(Spatial_integrated[["celltypeprops"]])) {
+      SpatialFeaturePlot(Spatial_integrated, features = "AT1", pt.size.factor = 6500)
+    } else {
+      message("Feature 'AT1' not found in 'celltypeprops' assay; skipping SpatialFeaturePlot.")
+    }
+    DefaultAssay(Spatial_integrated) <- "Spatial"
+  } else {
+    message("Assay 'celltypeprops' not found; skipping SpatialFeaturePlot.")
+  }
+
+  # Save object
+  save(Spatial_integrated, file = "251008_spatial_merge_and_nnls_define.Rdata")
