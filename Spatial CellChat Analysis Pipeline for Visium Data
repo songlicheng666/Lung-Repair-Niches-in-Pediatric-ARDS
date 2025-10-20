@@ -1,0 +1,236 @@
+# Spatial CellChat Analysis Pipeline for Visium Data
+# Purpose: Run CellChat spatial transcriptomics workflow on Seurat Visium objects,
+#          with transparent QC, robust inputs, and reproducible visualization.
+# Requirements: CellChat (>= v2), Seurat (>= v5 recommended), tidyverse, patchwork,
+#               Matrix, data.table, SeuratData, gt, RColorBrewer, gridExtra, jsonlite, future
+
+# -------------------------------
+# 0) Install and load packages
+# -------------------------------
+# Note: Installing from GitHub can be slow and version-sensitive. Run only once if needed.
+# devtools::install_github("jinworks/CellChat")
+# devtools::install_github("immunogenomics/presto")
+
+suppressPackageStartupMessages({
+  library(CellChat)
+  library(Seurat)
+  library(tidyverse)
+  library(patchwork)
+  library(Matrix)
+  library(data.table)
+  library(SeuratData)
+  library(gt)
+  library(RColorBrewer)
+  library(gridExtra)
+  library(jsonlite)
+  library(future)
+})
+
+# -------------------------------
+# 1) Inputs and basic checks
+# -------------------------------
+# Expect a Seurat object named DEATH (Visium), with SCT assay and regionLevel identities.
+if (!exists("DEATH")) stop("Object 'DEATH' not found. Please load your Seurat Visium object into DEATH.")
+
+# Use SCT assay and set identities
+if (!("SCT" %in% names(DEATH@assays))) stop("Assay 'SCT' not found in DEATH.")
+DefaultAssay(DEATH) <- "SCT"
+if (!("regionLevel" %in% colnames(DEATH@meta.data))) {
+  warning("Metadata 'regionLevel' not found. Using current Idents instead.")
+} else {
+  Idents(DEATH) <- "regionLevel"
+}
+
+# -------------------------------
+# 2) Cluster visualization and spatially variable features
+# -------------------------------
+# Quick feature plot
+suppressWarnings(
+  SpatialFeaturePlot(DEATH, features = c("COL1A2", "SFTPC"),
+                     pt.size.factor = 1.6, ncol = 2, crop = TRUE)
+)
+
+# Find spatially variable features (Moran's I)
+DEATH <- FindSpatiallyVariableFeatures(
+  DEATH,
+  assay = "SCT",
+  selection.method = "moransi",
+  features = rownames(DEATH),
+  r.metric = 5,
+  layer = "data" # Seurat v5: use 'layer' instead of deprecated 'slot'
+)
+
+top.clusters <- head(SpatiallyVariableFeatures(DEATH, selection.method = "moransi"), 6)
+SpatialPlot(object = DEATH, features = top.clusters, ncol = 2)
+
+# Palette for cluster labels
+nlev <- nlevels(DEATH)
+color.use <- scPalette(nlev); names(color.use) <- levels(DEATH)
+Seurat::SpatialDimPlot(DEATH, label = TRUE, label.size = 3, cols = color.use, pt.size.factor = 6000)
+
+# -------------------------------
+# 3) Prepare CellChat inputs
+# -------------------------------
+# Expression matrix (normalized). Seurat v5 uses 'layer', not 'slot'.
+data.input <- Seurat::GetAssayData(DEATH, assay = "SCT", layer = "data")
+
+# Metadata: labels and samples
+meta <- data.frame(labels = Seurat::Idents(DEATH),
+                   row.names = names(Seurat::Idents(DEATH)))
+# If you have multiple replicates, set meta$samples accordingly. Here we set a single sample.
+meta$samples <- factor("sample1", levels = "sample1")
+stopifnot(all(names(Seurat::Idents(DEATH)) == rownames(meta)))
+
+# Spatial coordinates (full-resolution Visium coordinates)
+spatial.locs <- Seurat::GetTissueCoordinates(DEATH, scale = NULL, cols = c("imagerow", "imagecol"))
+spatial.locs <- as.matrix(spatial.locs)
+
+# Spatial scale factors (pixels to micrometers)
+# Read from original scalefactors_json.json (Visium output). Update path to your dataset.
+# Avoid Chinese path to ensure cross-platform compatibility; set a local path.
+scalefactors_path <- file.path(getwd(), "scalefactors_json.json")
+if (!file.exists(scalefactors_path)) {
+  warning("scalefactors_json.json not found in working directory. Please set 'scalefactors_path' to your file.")
+}
+if (file.exists(scalefactors_path)) {
+  scalefactors <- jsonlite::fromJSON(txt = scalefactors_path)
+} else {
+  scalefactors <- list(spot_diameter_fullres = NA_real_)
+}
+spot.size <- 65                 # theoretical Visium spot size in micrometers
+conversion.factor <- spot.size / scalefactors$spot_diameter_fullres
+spatial.factors <- data.frame(ratio = conversion.factor, tol = spot.size / 2)
+
+# Verify minimal non-zero distance (should be ~100um)
+d.spatial <- computeCellDistance(coordinates = spatial.locs, ratio = spatial.factors$ratio, tol = spatial.factors$tol)
+message(sprintf("Min non-zero spatial distance: %.2f", min(d.spatial[d.spatial != 0], na.rm = TRUE)))
+
+# -------------------------------
+# 4) Create CellChat object
+# -------------------------------
+cellchat <- createCellChat(
+  object = data.input,
+  meta = meta,
+  group.by = "labels",
+  datatype = "spatial",
+  coordinates = spatial.locs,
+  spatial.factors = spatial.factors
+)
+print(cellchat)
+
+# Choose database: human or mouse
+# For human data:
+CellChatDB <- CellChatDB.human
+# For mouse data, uncomment:
+# CellChatDB <- CellChatDB.mouse
+
+showDatabaseCategory(CellChatDB)
+dplyr::glimpse(CellChatDB$interaction)
+
+# Use a subset for secreted signaling (recommended)
+CellChatDB.use <- subsetDB(CellChatDB, search = "Secreted Signaling", key = "annotation")
+cellchat@DB <- CellChatDB.use
+
+# Subset expression to signaling genes (required)
+cellchat <- subsetData(cellchat)
+
+# Parallelization
+future::plan("multisession", workers = max(1, parallel::detectCores() - 1))
+
+# Identify over-expressed genes and interactions
+cellchat <- identifyOverExpressedGenes(cellchat)
+cellchat <- identifyOverExpressedInteractions(cellchat, variable.both = FALSE)
+
+# -------------------------------
+# 5) Infer spatial communications
+# -------------------------------
+# Use truncated mean with diffusion and contact constraints
+cellchat <- computeCommunProb(
+  cellchat,
+  type = "truncatedMean",
+  trim = 0.1,
+  distance.use = TRUE,
+  interaction.range = 250,
+  scale.distance = 0.01,
+  contact.dependent = TRUE,
+  contact.range = 100
+)
+
+# Filter, compute pathway probabilities, aggregate networks
+cellchat <- filterCommunication(cellchat, min.cells = 10)
+cellchat <- computeCommunProbPathway(cellchat)
+cellchat <- aggregateNet(cellchat)
+
+# -------------------------------
+# 6) Visualization of networks
+# -------------------------------
+groupSize <- as.numeric(table(cellchat@idents))
+par(mfrow = c(1,2), xpd = TRUE)
+netVisual_circle(cellchat@net$count, vertex.weight = rowSums(cellchat@net$count), weight.scale = TRUE, label.edge = FALSE, title.name = "Number of interactions")
+netVisual_circle(cellchat@net$weight, vertex.weight = rowSums(cellchat@net$weight), weight.scale = TRUE, label.edge = FALSE, title.name = "Interaction weights/strength")
+
+netVisual_heatmap(cellchat, measure = "count", color.heatmap = "Blues")
+netVisual_heatmap(cellchat, measure = "weight", color.heatmap = "Blues")
+
+# Example pathway: IGF
+pathways.show <- c("IGF")
+par(mfrow = c(1,1), xpd = TRUE)
+netVisual_aggregate(cellchat, signaling = pathways.show, layout = "circle")
+par(mfrow = c(1,1))
+netVisual_aggregate(cellchat, signaling = pathways.show, layout = "spatial",
+                    edge.width.max = 2, vertex.size.max = 1, alpha.image = 0.2, vertex.label.cex = 3.5)
+
+# Compute centrality (pathway-level network)
+cellchat <- netAnalysis_computeCentrality(cellchat, slot.name = "netP")
+par(mfrow = c(1,1))
+netAnalysis_signalingRole_network(cellchat, signaling = pathways.show, width = 8, height = 2.5, font.size = 10)
+par(mfrow = c(1,1))
+netVisual_aggregate(cellchat, signaling = pathways.show, layout = "spatial",
+                    edge.width.max = 2, alpha.image = 0.2, vertex.weight = "incoming",
+                    vertex.size.max = 4, vertex.label.cex = 3.5)
+
+# Spatial feature plots on CellChat object
+spatialFeaturePlot(cellchat, features = c("Igf1","Igf1r"), point.size = 0.8, color.heatmap = "Reds", direction = 1)
+spatialFeaturePlot(cellchat, pairLR.use = "IGF1_IGF1R", point.size = 0.5, do.binary = FALSE, cutoff = 0.05, enriched.only = FALSE, color.heatmap = "Reds", direction = 1)
+spatialFeaturePlot(cellchat, pairLR.use = "IGF1_IGF1R", point.size = 1, do.binary = TRUE, cutoff = 0.05, enriched.only = FALSE, color.heatmap = "Reds", direction = 1)
+
+# Save object and launch app
+saveRDS(cellchat, file = "cellchat_visium_object.rds")
+# runCellChatApp(cellchat) # uncomment to launch the interactive app
+
+# -------------------------------
+# 7) Optional: rerun with relaxed filtering and EGF pathway examples
+# -------------------------------
+cellchat2 <- cellchat
+cellchat2 <- filterCommunication(cellchat2, min.cells = 5)
+cellchat2 <- computeCommunProbPathway(cellchat2)
+cellchat2 <- aggregateNet(cellchat2)
+
+par(mfrow = c(1,2), xpd = TRUE)
+netVisual_circle(cellchat2@net$count, vertex.weight = rowSums(cellchat2@net$count), weight.scale = TRUE, label.edge = FALSE, title.name = "Number of interactions")
+netVisual_circle(cellchat2@net$weight, vertex.weight = rowSums(cellchat2@net$weight), weight.scale = TRUE, label.edge = FALSE, title.name = "Interaction weights/strength")
+netVisual_heatmap(cellchat2, measure = "count", color.heatmap = "Blues")
+
+pathways.show.egf <- c("EGF")
+par(mfrow = c(1,1), xpd = TRUE)
+netVisual_aggregate(cellchat2, signaling = pathways.show.egf, layout = "circle")
+# If multiple samples exist (meta$samples), you can specify sample.use = "A1" etc.
+# netVisual_aggregate(cellchat2, signaling = pathways.show.egf, sample.use = "A1", layout = "spatial",
+#                     edge.width.max = 2, vertex.size.max = 1, alpha.image = 0.2, vertex.label.cex = 0)
+
+cellchat2 <- netAnalysis_computeCentrality(cellchat2, slot.name = "netP")
+par(mfrow = c(1,1))
+netAnalysis_signalingRole_network(cellchat2, signaling = pathways.show.egf, width = 8, height = 2.5, font.size = 10)
+par(mfrow = c(1,1))
+netVisual_aggregate(cellchat2, signaling = pathways.show.egf, layout = "spatial",
+                    edge.width.max = 2, alpha.image = 0.2, vertex.weight = "incoming",
+                    vertex.size.max = 6, vertex.label.cex = 0)
+netAnalysis_contribution(cellchat2, signaling = pathways.show.egf)
+
+# Example ligand-receptor spatial features (requires meta$samples with levels like "A1","A2")
+# spatialFeaturePlot(cellchat2, features = c("AREG","EGFR"), sample.use = "A1", point.size = 0.8, color.heatmap = "Reds", direction = 1)
+# spatialFeaturePlot(cellchat2, features = c("AREG","EGFR"), sample.use = "A2", point.size = 0.8, color.heatmap = "Reds", direction = 1)
+# spatialFeaturePlot(cellchat2, pairLR.use = "AREG_EGFR", sample.use = "A1", point.size = 0.5, do.binary = FALSE, cutoff = 0.05, enriched.only = FALSE, color.heatmap = "Reds", direction = 1)
+# spatialFeaturePlot(cellchat2, pairLR.use = "AREG_EGFR", sample.use = "A1", point.size = 1.5, do.binary = TRUE, cutoff = 0.05, enriched.only = FALSE, color.heatmap = "Reds", direction = 1)
+
+saveRDS(cellchat2, file = "cellchat_visium_relaxed_filter.rds")
