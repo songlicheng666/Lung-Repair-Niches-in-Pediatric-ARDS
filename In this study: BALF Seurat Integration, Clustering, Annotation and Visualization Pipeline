@@ -1,0 +1,231 @@
+# BALF Seurat Integration, Clustering, Annotation and Visualization Pipeline
+# Purpose: Perform standard Seurat workflow for BALF scRNA-seq:
+#   - Data loading and preprocessing
+#   - Split by sample and integration
+#   - Scaling, PCA, neighbors, clustering, UMAP/TSNE
+#   - Marker detection and visualization
+#   - Manual celltype annotation and proportion analysis
+# Requirements: Seurat, tidyverse, SingleR, celldex, ggplot2, dplyr, patchwork,
+#               SingleCellExperiment, cowplot, ggsci, paletteer, RColorBrewer, data.table, DT
+
+# -------------------------------
+# 0) Clean environment and setup
+# -------------------------------
+rm(list = ls())
+options(stringsAsFactors = FALSE)
+# Use an English path for portability; update to your own directory
+setwd("D:/BALF")
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(ggplot2)
+  library(tidyverse)
+  library(SingleR)
+  library(celldex)
+  library(RColorBrewer)
+  library(SingleCellExperiment)
+  library(dplyr)
+  library(patchwork)
+  library(ggsci)
+  library(cowplot)
+  library(paletteer)
+  library(data.table)
+  library(DT)
+  library(gplots)
+})
+
+# -------------------------------
+# 1) Load data
+# -------------------------------
+# Load a Seurat object 'sce' from Rdata. Ensure the file exists.
+input_rdata <- 'E:/BALF/first_sce.Rdata'
+if (!file.exists(input_rdata)) stop(sprintf("Input file not found: %s", input_rdata))
+load(file = input_rdata) # loads 'sce'
+if (!exists("sce")) stop("Object 'sce' not found after loading.")
+
+# Optional: check patient/source grouping columns availability
+if (!("patients" %in% colnames(sce@meta.data))) {
+  message("Metadata 'patients' not found. Please create sce@meta.data$patients if needed.")
+}
+if (!("cell.orig" %in% colnames(sce@meta.data))) {
+  message("Metadata 'cell.orig' not found. Please create sce@meta.data$cell.orig if needed.")
+}
+
+# Basic summaries
+if ("patients" %in% colnames(sce@meta.data)) print(table(sce@meta.data$patients))
+if ("cell.orig" %in% colnames(sce@meta.data)) print(table(sce@meta.data$cell.orig))
+print(dim(sce))
+
+# -------------------------------
+# 2) Split and integrate by orig.ident
+# -------------------------------
+if (!("orig.ident" %in% colnames(sce@meta.data))) {
+  stop("Metadata 'orig.ident' is required for SplitObject. Please add 'orig.ident' to sce@meta.data.")
+}
+sce.list <- SplitObject(sce, split.by = "orig.ident")
+sce.list <- lapply(sce.list, function(x) {
+  x <- NormalizeData(x, normalization.method = "LogNormalize")
+  x <- FindVariableFeatures(x, selection.method = "vst", nfeatures = 2000)
+  x
+})
+features <- SelectIntegrationFeatures(object.list = sce.list)
+sce.anchors <- FindIntegrationAnchors(object.list = sce.list, anchor.features = features)
+sce <- IntegrateData(anchorset = sce.anchors)
+
+# -------------------------------
+# 3) Scaling, PCA and visualization of loadings
+# -------------------------------
+DefaultAssay(sce) <- "integrated"
+all.genes <- rownames(sce)
+sce <- ScaleData(sce, features = all.genes)
+sce <- RunPCA(sce, features = VariableFeatures(object = sce))
+print(sce[["pca"]], dims = 1:5, nfeatures = 5)  # show top features for first 5 PCs
+VizDimLoadings(sce, dims = 1:2, reduction = "pca")
+DimHeatmap(sce, dims = 1:15, cells = 500, balanced = TRUE)
+
+# -------------------------------
+# 4) Neighbors, clustering, UMAP/TSNE
+# -------------------------------
+sce <- FindNeighbors(sce, dims = 1:30)          # compute nearest neighbors
+sce <- FindClusters(sce, resolution = 0.5)      # cluster cells
+tab.1 <- table(sce@meta.data$integrated_snn_res.0.5, sce@meta.data$integrated_snn_res.0.5)
+balloonplot(tab.1, main = "Cluster self-counts")
+
+set.seed(123)
+sce <- RunUMAP(sce, dims = 1:30, do.fast = TRUE, check_duplicates = FALSE)
+DimPlot(sce, reduction = "umap", label = TRUE)
+
+# If TSNE embeddings are not present, compute them
+if (!("tsne" %in% names(sce@reductions))) {
+  sce <- RunTSNE(sce, dims = 1:30, check_duplicates = FALSE)
+}
+tsne_pos <- Embeddings(sce, "tsne")
+DimPlot(sce, reduction = "tsne", group.by = "patients", label = FALSE)
+
+# -------------------------------
+# 5) Marker detection
+# -------------------------------
+Idents(sce) <- "seurat_clusters"
+sce.markers <- FindAllMarkers(object = sce, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+pro <- "first"
+DT::datatable(sce.markers)
+write.csv(sce.markers, file = paste0(pro, '_BALF_sub_sce.markers_tsne.csv'), row.names = FALSE)
+
+DimPlot(sce, reduction = "tsne", group.by = "orig.ident")
+if ("patients" %in% colnames(sce@meta.data)) {
+  DimPlot(sce, reduction = "tsne", label = TRUE, split.by = "patients")
+}
+DimPlot(sce, reduction = "tsne", label = TRUE, split.by = "orig.ident")
+
+# Top 10 markers per cluster
+top10 <- sce.markers %>% dplyr::group_by(cluster) %>% dplyr::slice_max(order_by = avg_log2FC, n = 10)
+write.csv(top10, file = paste0(pro, '_BALF_sub_sce.markers_top10.csv'), row.names = FALSE)
+p <- DoHeatmap(sce, features = top10$gene, size = 3)
+print(p)
+ggsave(filename = paste0(pro, '_BALF_sub_sce.markers_heatmap_TSNE.pdf'), plot = p, width = 8, height = 10)
+
+# -------------------------------
+# 6) Marker-based inspection
+# -------------------------------
+genes_to_check <- c('CXCL8', 'S100A9', 'MMP9',        # Neutrophil
+                    'MARCO', 'MSR1', 'MRC1',          # Macrophage
+                    'CD3D', 'CD3E',                   # T cell markers
+                    'CST3', 'CD1C',                   # mDC
+                    'CDH1', 'EPCAM',                  # Epithelium
+                    'MS4A1', 'CD79A', 'MZB1')         # B cell
+if ("celltype" %in% colnames(sce@meta.data)) {
+  DotPlot(sce, group.by = 'celltype', features = unique(genes_to_check)) + RotatedAxis()
+} else {
+  DotPlot(sce, group.by = 'seurat_clusters', features = unique(genes_to_check)) + RotatedAxis()
+}
+
+genes_to_check2 <- c("SPRR3","GDPD3","SPRR1A","SPRR2A","RARRES2","TMPRSS11E",
+                     "ASCL3","CFTR","FOXI2","ISG20","FOXI1",
+                     "SAA4","SAA2","EFHC1","CCDC153","CCDC113","SAA1","CDC20B","FOXJ1",
+                     "MYCL","FOXN4","CCNO",
+                     "PIGR","XBP1","MUC5AC","VMO1","SCGB3A1","CYP2A13","CYP2B6","SCGB1A1",
+                     "BCAM","KRT1","KRT5","TP63")  # Basal/secretory/ciliated markers
+DotPlot(sce, group.by = 'seurat_clusters', features = unique(genes_to_check2)) + RotatedAxis()
+
+# -------------------------------
+# 7) Manual relabeling of clusters
+# -------------------------------
+new.cluster.ids <- c("0"  = "neutrophil",
+                     "1"  = "neutrophil",
+                     "2"  = "macrophage",
+                     "3"  = "neutrophil",
+                     "4"  = "macrophage",
+                     "5"  = "macrophage",
+                     "6"  = "T cell",
+                     "7"  = "DC",
+                     "8"  = "macrophage",
+                     "9"  = "Epithelium",
+                     "10" = "macrophage",
+                     "11" = "Epithelium",
+                     "12" = "DC",
+                     "13" = "T cell",
+                     "14" = "neutrophil",
+                     "15" = "B cell",
+                     "16" = "Epithelium")
+# Safety check: ensure all cluster IDs exist
+missing_ids <- setdiff(names(new.cluster.ids), as.character(sort(unique(sce$seurat_clusters))))
+if (length(missing_ids) > 0) {
+  warning(sprintf("Some cluster IDs in relabel map not found: %s", paste(missing_ids, collapse = ", ")))
+}
+sce <- RenameIdents(sce, new.cluster.ids)
+sce$celltype <- as.factor(as.character(sce@active.ident))
+DimPlot(sce, reduction = "tsne", label = TRUE)
+DimPlot(sce, reduction = "umap", label = TRUE, group.by = "celltype")
+
+# -------------------------------
+# 8) Save object
+# -------------------------------
+save(sce, file = 'BALF_subgroup_sce.Rdata')
+print(levels(sce))
+
+# -------------------------------
+# 9) Cell proportion analysis by group
+# -------------------------------
+# Compute per-group cell proportions and visualize with stacked bar chart.
+if (!("patients" %in% colnames(sce@meta.data))) {
+  warning("Metadata 'patients' not found. Proportion analysis by patients will be skipped.")
+} else {
+  print(table(sce$orig.ident))   # cells per sample
+  print(table(sce$patients))     # cells per patient group
+  
+  Idents(sce) <- "celltype"
+  print(prop.table(table(Idents(sce))))                      # overall proportions
+  print(table(Idents(sce), sce$patients))                    # counts per group
+  Cellratio <- prop.table(table(Idents(sce), sce$patients), margin = 2) # column-wise proportions
+  Cellratio <- as.data.frame(Cellratio)
+  
+  gg_bar <- ggplot(Cellratio) +
+    geom_bar(aes(x = Var2, y = Freq, fill = Var1), stat = "identity", width = 0.7, size = 0.5, colour = '#222222') +
+    theme_classic() +
+    labs(x = 'Group', y = 'Cell proportion') +
+    coord_flip() +
+    theme(panel.border = element_rect(fill = NA, color = "black", size = 0.5, linetype = "solid"))
+  print(gg_bar)
+  ggsave("BALF_celltype_proportions_by_group.pdf", gg_bar, width = 6, height = 4)
+}
+
+# -------------------------------
+# 10) Feature visualization by group
+# -------------------------------
+# Example gene: BDH1
+if ("patients" %in% colnames(sce@meta.data)) {
+  p_vln <- VlnPlot(sce, features = "BDH1", split.by = "patients")
+  print(p_vln)
+  ggsave("BALF_BDH1_vln_by_patients.pdf", p_vln, width = 6, height = 4)
+  
+  p_feat <- FeaturePlot(sce, features = "BDH1", reduction = "tsne", split.by = "patients", pt.size = 1) +
+    scale_x_continuous("") + scale_y_continuous("") +
+    theme_bw() +
+    theme(
+      panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+      axis.ticks = element_blank(), axis.text = element_blank(),
+      plot.title = element_text(hjust = 0.5, size = 14)
+    )
+  print(p_feat)
+  ggsave("BALF_BDH1_tsne_by_patients.pdf", p_feat, width = 7, height = 5)
+}
