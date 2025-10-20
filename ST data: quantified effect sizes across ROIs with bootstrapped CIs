@@ -1,0 +1,232 @@
+library(dplyr)
+library(Seurat)
+library(ggplot2)
+library(purrr)
+library(boot)
+library(spdep)
+library(sf)
+library(FNN)
+table(Spatial_integrated$regionLevel)
+assay_name <- ifelse("SCT" %in% names(Spatial_integrated@assays), "SCT", "Spatial")
+DefaultAssay(Spatial_integrated) <- assay_name
+expr_mat <- GetAssayData(Spatial_integrated, assay = assay_name, slot = "data")
+genes_needed <- intersect(c("WT1","SPP1"), rownames(expr_mat))
+if(length(genes_needed) < 2) stop("WT1或SPP1在当前assay缺失，请检查基因名或assay。")
+minmax <- function(x){rng <- range(x, na.rm=TRUE); if(diff(rng)==0) return(rep(0,length(x))); (x - rng[1]) / (rng[2] - rng[1])}
+wt1_norm <- minmax(expr_mat["WT1", ])
+spp1_norm <- minmax(expr_mat["SPP1", ])
+joint_score <- (wt1_norm + spp1_norm)/2
+Spatial_integrated$WT1_SPP1_joint <- joint_score
+if(!"celltypeprops" %in% names(Spatial_integrated@assays)) stop("缺少celltypeprops assay，请先运行NNLS/RCTD生成。")
+DefaultAssay(Spatial_integrated) <- "celltypeprops"
+sp_names <- rownames(Spatial_integrated[["celltypeprops"]])
+hit <- grep("^SPP1(_MAC)?$", sp_names, value = TRUE)
+if(length(hit) == 0){ hit <- grep("SPP1", sp_names, value = TRUE) }
+if(length(hit) == 0){ stop("celltypeprops中未找到包含SPP1的特征，请检查命名或assay。") }
+Spatial_integrated$SPP1_MAC <- GetAssayData(Spatial_integrated, assay = "celltypeprops", slot = "data")[hit[1], ]
+spp1_mac <- Spatial_integrated$SPP1_MAC
+Spatial_integrated$SPP1_MAC_weight <- spp1_mac
+
+get_coords_by_sample <- function(obj, sample){
+  md <- obj@meta.data %>% dplyr::filter(orig.ident == sample)
+  if(all(c("imagecol","imagerow") %in% colnames(md))){
+    coords <- md[, c("imagecol","imagerow")]
+  } else {
+    tc <- Seurat::GetTissueCoordinates(obj)
+    coords <- tc[rownames(md), colnames(tc)[1:2], drop = FALSE]
+  }
+  rownames(coords) <- rownames(md)
+  coords
+}
+coords_live  <- get_coords_by_sample(Spatial_integrated, "LIVE")
+coords_death <- get_coords_by_sample(Spatial_integrated, "DEATH")
+
+hedges_g <- function(x,y){
+  nx <- length(x); ny <- length(y)
+  vx <- var(x, na.rm=TRUE); vy <- var(y, na.rm=TRUE)
+  sp <- sqrt(((nx-1)*vx + (ny-1)*vy) / (nx+ny-2))
+  g <- (mean(x, na.rm=TRUE) - mean(y, na.rm=TRUE)) / sp
+  J <- 1 - (3/(4*(nx+ny)-9))
+  g*J
+}
+boot_hedges <- function(x,y, R=1000){
+  x <- x[is.finite(x)]
+  y <- y[is.finite(y)]
+  dat <- list(x=x,y=y)
+  stat_fun <- function(d, idx){
+    ix <- sample(seq_along(d$x), length(d$x), replace=TRUE)
+    iy <- sample(seq_along(d$y), length(d$y), replace=TRUE)
+    hedges_g(d$x[ix], d$y[iy])
+  }
+  b <- boot(dat, statistic = stat_fun, R = R)
+  ci <- boot.ci(b, type="bca")
+  list(g=hedges_g(x,y), ci=ci)
+}
+cliffs_delta <- function(x,y){
+  x <- x[is.finite(x)]
+  y <- y[is.finite(y)]
+  nx <- length(x); ny <- length(y)
+  comp <- outer(x, y, function(a,b) sign(a-b))
+  delta <- (sum(comp>0) - sum(comp<0)) / (nx*ny)
+  delta
+}
+boot_cliffs <- function(x,y, R=1000){
+  x <- x[is.finite(x)]
+  y <- y[is.finite(y)]
+  dat <- list(x=x,y=y)
+  stat_fun <- function(d, idx){
+    ix <- sample(seq_along(d$x), length(d$x), replace=TRUE)
+    iy <- sample(seq_along(d$y), length(d$y), replace=TRUE)
+    cliffs_delta(d$x[ix], d$y[iy])
+  }
+  b <- boot(dat, statistic = stat_fun, R=R)
+  ci <- boot.ci(b, type="bca")
+  list(delta=cliffs_delta(x,y), ci=ci)
+}
+
+md <- Spatial_integrated@meta.data
+md_live <- md %>% filter(orig.ident=="LIVE")
+scores_live <- md_live %>%
+  mutate(WT1_SPP1_joint = Spatial_integrated$WT1_SPP1_joint[rownames(md_live)],
+         SPP1_MAC_weight = Spatial_integrated$SPP1_MAC_weight[rownames(md_live)])
+x_air <- scores_live %>% filter(regionLevel=="airleak") %>% pull(WT1_SPP1_joint)
+y_non <- scores_live %>% filter(regionLevel!="airleak") %>% pull(WT1_SPP1_joint)
+res_g_joint <- boot_hedges(x_air, y_non, R=2000)
+res_delta_joint <- boot_cliffs(x_air, y_non, R=2000)
+x_air_mac <- scores_live %>% filter(regionLevel=="airleak") %>% pull(SPP1_MAC_weight)
+y_non_mac <- scores_live %>% filter(regionLevel!="airleak") %>% pull(SPP1_MAC_weight)
+res_g_mac <- boot_hedges(x_air_mac, y_non_mac, R=2000)
+res_delta_mac <- boot_cliffs(x_air_mac, y_non_mac, R=2000)
+
+tc <- Seurat::GetTissueCoordinates(Spatial_integrated)
+stopifnot(all(c("imagecol","imagerow") %in% colnames(tc)))
+img_death <- Spatial_integrated@images[["DEATH"]]
+md_death <- Spatial_integrated@meta.data %>% dplyr::filter(orig.ident == "DEATH")
+coords_death <- Spatial_integrated@images[["DEATH"]]@coordinates[, c("imagecol","imagerow")]
+common <- intersect(rownames(md_death), rownames(coords_death))
+coords_death <- coords_death[common, , drop = FALSE]
+weights_death <- Spatial_integrated$SPP1_MAC_weight[common]
+
+keep <- complete.cases(coords_death) & is.finite(weights_death)
+coords_death_clean <- as.matrix(coords_death[keep, , drop = FALSE])
+weights_death_clean <- weights_death[keep]
+n_death <- nrow(coords_death_clean)
+if(n_death < 3) stop("DEATH可用spot数不足(<3)")
+k_death <- min(6, n_death - 1)
+nb_death <- spdep::knn2nb(spdep::knearneigh(coords_death_clean, k = k_death))
+moran_mc_death <- spdep::moran.mc(weights_death_clean, listw = spdep::nb2listw(nb_death, style = "W"), nsim = 999)
+mt_death <- spdep::moran.test(weights_death_clean, spdep::nb2listw(nb_death, style = "W"))
+
+scores_death <- md_death %>%
+  mutate(WT1_SPP1_joint = Spatial_integrated$WT1_SPP1_joint[rownames(md_death)],
+         SPP1_MAC_weight = Spatial_integrated$SPP1_MAC_weight[rownames(md_death)])
+ctrl_roi <- "fibroblastexpanding"
+x_ctrl <- scores_death %>% filter(regionLevel==ctrl_roi) %>% pull(WT1_SPP1_joint)
+y_others <- scores_death %>% filter(regionLevel!=ctrl_roi) %>% pull(WT1_SPP1_joint)
+res_g_joint_death <- boot_hedges(x_ctrl, y_others, R=2000)
+res_delta_joint_death <- boot_cliffs(x_ctrl, y_others, R=2000)
+x_ctrl_mac <- scores_death %>% dplyr::filter(regionLevel == ctrl_roi) %>% dplyr::pull(SPP1_MAC_weight)
+y_others_mac <- scores_death %>% dplyr::filter(regionLevel != ctrl_roi) %>% dplyr::pull(SPP1_MAC_weight)
+res_g_mac_death <- boot_hedges(x_ctrl_mac, y_others_mac, R=2000)
+res_delta_mac_death <- boot_cliffs(x_ctrl_mac, y_others_mac, R=2000)
+
+weights_live  <- Spatial_integrated$SPP1_MAC_weight[rownames(coords_live)]
+weights_death <- Spatial_integrated$SPP1_MAC_weight[rownames(coords_death)]
+keep_live  <- stats::complete.cases(coords_live)  & is.finite(weights_live)
+keep_death <- stats::complete.cases(coords_death) & is.finite(weights_death)
+coords_live_clean   <- as.matrix(coords_live[keep_live, , drop = FALSE])
+weights_live_clean  <- weights_live[keep_live]
+coords_death_clean  <- as.matrix(coords_death[keep_death, , drop = FALSE])
+weights_death_clean <- weights_death[keep_death]
+n_live  <- nrow(coords_live_clean)
+n_death <- nrow(coords_death_clean)
+stopifnot(n_live  >= 3, n_death >= 3)
+k_live  <- min(6, n_live  - 1)
+k_death <- min(6, n_death - 1)
+
+calc_moran <- function(weights, coords, k = 6){
+  stopifnot(is.matrix(coords), ncol(coords) >= 2, length(weights) == nrow(coords))
+  k <- min(k, nrow(coords) - 1)
+  knn_obj <- spdep::knearneigh(coords, k = k)
+  nb <- spdep::knn2nb(knn_obj)
+  lw <- spdep::nb2listw(nb, style = "W")
+  spdep::moran.test(weights, lw)
+}
+mt_live  <- calc_moran(weights_live_clean,  coords_live_clean,  k = k_live)
+mt_death <- calc_moran(weights_death_clean, coords_death_clean, k = k_death)
+
+knn_live <- spdep::knearneigh(coords_live_clean, k = k_live)
+nb_live  <- spdep::knn2nb(knn_live)
+moran_mc_live <- spdep::moran.mc(weights_live_clean, listw = spdep::nb2listw(nb_live, style = "W"), nsim = 999)
+
+knn_death <- spdep::knearneigh(coords_death_clean, k = k_death)
+nb_death  <- spdep::knn2nb(knn_death)
+moran_mc_death <- spdep::moran.mc(weights_death_clean, listw = spdep::nb2listw(nb_death, style = "W"), nsim = 999)
+
+roi_boot <- function(df, var, R=1000){
+  rois <- unique(df$regionLevel)
+  map_df(rois, function(r){
+    x <- df %>% filter(regionLevel==r) %>% pull(!!sym(var))
+    if(length(x) < 10) return(tibble(regionLevel=r, mean=mean(x,na.rm=TRUE), lower=NA, upper=NA, n=length(x)))
+    stat_fun <- function(d, idx){ mean(d[idx], na.rm=TRUE) }
+    b <- boot(x, statistic = stat_fun, R=R)
+    ci <- tryCatch(boot.ci(b, type="bca"), error=function(e) NULL)
+    tibble(regionLevel=r, mean=mean(x,na.rm=TRUE),
+           lower=if(!is.null(ci)) ci$bca[4] else NA,
+           upper=if(!is.null(ci)) ci$bca[5] else NA,
+           n=length(x))
+  })
+}
+
+boot_live_joint <- roi_boot(scores_live %>% select(regionLevel, WT1_SPP1_joint), "WT1_SPP1_joint", R=2000)
+boot_live_mac   <- roi_boot(scores_live %>% select(regionLevel, SPP1_MAC_weight), "SPP1_MAC_weight", R=2000)
+boot_death_joint <- roi_boot(scores_death %>% select(regionLevel, WT1_SPP1_joint), "WT1_SPP1_joint", R=2000)
+boot_death_mac   <- roi_boot(scores_death %>% select(regionLevel, SPP1_MAC_weight), "SPP1_MAC_weight", R=2000)
+
+forest_df <- dplyr::bind_rows(
+  tibble::tibble(
+    sample  = "LIVE",
+    measure = "WT1_SPP1_joint",
+    effect  = res_g_joint$g,
+    ci_low  = res_g_joint$ci[["bca"]][1, 4],
+    ci_high = res_g_joint$ci[["bca"]][1, 5]
+  ),
+  tibble::tibble(
+    sample  = "LIVE",
+    measure = "SPP1_MAC_weight",
+    effect  = res_g_mac$g,
+    ci_low  = res_g_mac$ci[["bca"]][1, 4],
+    ci_high = res_g_mac$ci[["bca"]][1, 5]
+  ),
+  tibble::tibble(
+    sample  = "DEATH",
+    measure = "WT1_SPP1_joint",
+    effect  = res_g_joint_death$g,
+    ci_low  = res_g_joint_death$ci[["bca"]][1, 4],
+    ci_high = res_g_joint_death$ci[["bca"]][1, 5]
+  ),
+  tibble::tibble(
+    sample  = "DEATH",
+    measure = "SPP1_MAC_weight",
+    effect  = res_g_mac_death$g,
+    ci_low  = res_g_mac_death$ci[["bca"]][1, 4],
+    ci_high = res_g_mac_death$ci[["bca"]][1, 5]
+  )
+) |>
+  dplyr::mutate(
+    ci_min = pmin(ci_low, ci_high),
+    ci_max = pmax(ci_low, ci_high)
+  )
+pdf("quantified effect sizes across ROIs with bootstrapped CIs.pdf",height=3,width=8)
+ggplot(forest_df, aes(x=measure, y=effect, ymin=ci_low, ymax=ci_high, color=sample)) +
+  geom_pointrange(position=position_dodge(width=0.5)) +
+  geom_hline(yintercept=0, linetype="dashed") +
+  coord_flip() +
+  labs(title="Effect sizes with 95% BCa CIs", y="Hedges' g", x="Measure") +
+  theme_minimal()
+dev.off()
+print(res_g_joint$ci[["bca"]])
+print(res_g_mac$ci[["bca"]])
+str(res_g_joint$ci[["bca"]])
+str(res_g_mac$ci[["bca"]])
+save(Spatial_integrated,file="用于分析pleural的数据.Rdata")
