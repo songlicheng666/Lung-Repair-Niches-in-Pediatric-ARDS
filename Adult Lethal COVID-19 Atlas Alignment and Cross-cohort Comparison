@@ -1,0 +1,449 @@
+# Adult Lethal COVID-19 Atlas Alignment and Cross-cohort Comparison Pipeline
+# Overview:
+# - Keep each dataset's curated annotations; do NOT hard-merge and re-cluster.
+# - Main path: label alignment via Seurat TransferAnchors (adult as reference).
+# - Optional: integrated UMAP across cohorts for visualization only.
+# - Outputs: paired UMAPs, cross-label heatmaps, marker heatmaps/dotplots, proportions by sample/group, fibroblast-focused panels.
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(ggplot2)
+  library(purrr)
+  library(tidyr)
+  library(patchwork)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(Matrix)
+  library(rstatix)
+  library(viridis)
+  library(readr)
+  library(scales)
+})
+
+# ---------------------------------------
+# 0) Basic checks and standard setup
+# ---------------------------------------
+# Expected objects in environment:
+#   - sce: adult lethal COVID-19 scRNA (Nature 2021), with celltype2, group, donor_id (or sample id)
+#   - query: your pediatric ARDS scRNA, with celltype2 (or celltype), group, orig.ident
+# Optionally:
+#   - total_sce: your master object to which refaligned labels will be injected for visualization
+
+stopifnot(exists("sce"), exists("query"))
+if (!"RNA" %in% Assays(sce)) stop("sce must have RNA assay")
+if (!"RNA" %in% Assays(query)) stop("query must have RNA assay")
+DefaultAssay(sce) <- "RNA"
+DefaultAssay(query) <- "RNA"
+
+# Ensure required meta columns exist (adapt if your field names differ)
+req_sce_cols <- c("celltype2", "group")
+req_qry_cols <- c("group", "orig.ident")
+if (!all(req_sce_cols %in% colnames(sce@meta.data))) {
+  stop("sce is missing required columns: ", paste(setdiff(req_sce_cols, colnames(sce@meta.data)), collapse = ", "))
+}
+if (!all(req_qry_cols %in% colnames(query@meta.data))) {
+  stop("query is missing required columns: ", paste(setdiff(req_qry_cols, colnames(query@meta.data)), collapse = ", "))
+}
+
+# Create output folders
+dir.create("results/adult_covid_atlas/figures", recursive = TRUE, showWarnings = FALSE)
+dir.create("results/adult_covid_atlas/tables", recursive = TRUE, showWarnings = FALSE)
+
+# Intersect genes for comparable operations
+common_genes <- intersect(rownames(sce), rownames(query))
+sce <- subset(sce, features = common_genes)
+query <- subset(query, features = common_genes)
+
+# Define label columns to align
+ref_label_col <- "celltype2"   # labels in sce
+qry_label_col <- if ("celltype2" %in% colnames(query@meta.data)) "celltype2" else if ("celltype" %in% colnames(query@meta.data)) "celltype" else stop("query needs celltype2 or celltype")
+
+# ---------------------------------------
+# 1) Path 1 — Label alignment (recommended main analysis)
+# ---------------------------------------
+sce <- NormalizeData(sce)
+sce <- FindVariableFeatures(sce, nfeatures = 3000)
+query <- NormalizeData(query)
+query <- FindVariableFeatures(query, nfeatures = 3000)
+
+anchors <- FindTransferAnchors(
+  reference = sce,
+  query = query,
+  dims = 1:30,
+  reference.reduction = "pca",
+  features = intersect(VariableFeatures(sce), VariableFeatures(query))
+)
+transfer <- TransferData(
+  anchorset = anchors,
+  refdata = sce@meta.data[[ref_label_col]],
+  dims = 1:30
+)
+query$refaligned_celltype2 <- transfer$predicted.id
+query$refaligned_score     <- transfer$prediction.score.max
+query$refaligned_confident <- query$refaligned_score >= 0.6
+
+# Reverse mapping for consistency check (optional)
+anchors_rev <- FindTransferAnchors(
+  reference = query,
+  query = sce,
+  dims = 1:30,
+  features = intersect(VariableFeatures(query), VariableFeatures(sce))
+)
+transfer_rev <- TransferData(
+  anchorset = anchors_rev,
+  refdata = query@meta.data[[qry_label_col]],
+  dims = 1:30
+)
+sce$qryaligned_celltype2 <- transfer_rev$predicted.id
+sce$qryaligned_score     <- transfer_rev$prediction.score.max
+
+# Common cell types (exclude cycling if desired)
+common_types <- intersect(unique(sce@meta.data$celltype2), unique(query$refaligned_celltype2))
+common_types <- setdiff(common_types, c("Cycling epithelial", "Cycling NK/T cells"))
+
+# Cross-tab heatmap (celltype2 vs refaligned_celltype2) using your total object if available
+if (exists("total_sce")) {
+  if (!("refaligned_celltype2" %in% colnames(total_sce@meta.data))) {
+    message("Injecting refaligned_celltype2 from query into total_sce via shared barcodes...")
+    map_df <- data.frame(
+      cell = rownames(query@meta.data),
+      refaligned_celltype2 = as.character(query@meta.data$refaligned_celltype2),
+      stringsAsFactors = FALSE
+    )
+    new_label <- rep(NA_character_, nrow(total_sce@meta.data))
+    names(new_label) <- rownames(total_sce@meta.data)
+    common_cells <- intersect(rownames(total_sce@meta.data), map_df$cell)
+    idx <- match(common_cells, map_df$cell)
+    new_label[common_cells] <- map_df$refaligned_celltype2[idx]
+    total_sce$refaligned_celltype2 <- new_label
+  }
+  cross_table <- table(total_sce$celltype2, total_sce$refaligned_celltype2)
+} else {
+  # Fallback: cross table from query only (mapped vs its own original)
+  if (qry_label_col %in% colnames(query@meta.data)) {
+    cross_table <- table(query@meta.data[[qry_label_col]], query$refaligned_celltype2)
+    dimnames(cross_table) <- list(celltype2 = rownames(cross_table), refaligned_celltype2 = colnames(cross_table))
+  } else {
+    cross_table <- table(query$refaligned_celltype2, query$refaligned_celltype2)
+  }
+}
+
+# Cluster rows/cols and compute percentages per row
+row_order <- hclust(dist(cross_table))$order
+col_order <- hclust(dist(t(cross_table)))$order
+ordered_cross_table <- cross_table[row_order, col_order, drop = FALSE]
+cross_df <- as.data.frame(as.table(ordered_cross_table)) %>%
+  dplyr::group_by(Var1) %>%
+  dplyr::mutate(Percentage = Freq / pmax(sum(Freq), 1) * 100) %>%
+  dplyr::ungroup() %>%
+  dplyr::rename(celltype2 = Var1, refaligned_celltype2 = Var2)
+# Filter out cycling types if present
+cross_df <- cross_df %>%
+  dplyr::filter(
+    celltype2 != "Cycling epithelial",
+    celltype2 != "Cycling NK/T cells",
+    refaligned_celltype2 != "Cycling epithelial",
+    refaligned_celltype2 != "Cycling NK/T cells"
+  )
+readr::write_csv(cross_df, "results/adult_covid_atlas/tables/cross_label_percentage.csv")
+pdf("results/adult_covid_atlas/figures/cross_label_heatmap.pdf", width = 8, height = 7)
+print(
+  ggplot(cross_df, aes(x = refaligned_celltype2, y = celltype2, fill = Percentage)) +
+    geom_tile(color = "white") +
+    scale_fill_gradient2(name = "Percentage (%)", low = "grey", mid = "yellow", high = "red", midpoint = 50) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1), axis.text.y = element_text(size = 8)) +
+    labs(title = "Celltype2 vs Refaligned Celltype2 (clustered, % by row)", x = "Refaligned celltype2", y = "Celltype2")
+)
+dev.off()
+
+# ---------------------------------------
+# 2) Paired UMAP on each dataset (no hard merge)
+# ---------------------------------------
+if (!"umap" %in% names(sce@reductions)) {
+  sce <- ScaleData(sce, verbose = FALSE)
+  sce <- RunPCA(sce, npcs = 50, verbose = FALSE)
+  sce <- RunUMAP(sce, dims = 1:30, reduction.name = "umap", reduction.key = "UMAP_")
+}
+if (!"umap" %in% names(query@reductions)) {
+  query <- ScaleData(query, verbose = FALSE)
+  query <- RunPCA(query, npcs = 50, verbose = FALSE)
+  query <- RunUMAP(query, dims = 1:30, reduction.name = "umap", reduction.key = "UMAP_")
+}
+save(query, sce, file = "results/adult_covid_atlas/paired_objects_for_alignment.Rdata")
+
+p_sce_umap <- DimPlot(sce, reduction = "umap", group.by = ref_label_col, label = FALSE, repel = TRUE) +
+  ggtitle("Adult lethal COVID-19 - celltype2")
+p_query_umap <- DimPlot(query, reduction = "umap", group.by = "refaligned_celltype2", label = FALSE, repel = TRUE) +
+  ggtitle("Pediatric ARDS - mapped to adult (celltype2)")
+p_umap_pair <- p_sce_umap + p_query_umap + plot_layout(ncol = 2)
+ggsave("results/adult_covid_atlas/figures/FigS12_UMAP_pair.pdf", p_umap_pair, width = 25, height = 7, dpi = 300)
+
+# ---------------------------------------
+# 3) Marker panels: heatmaps and dotplots (adult vs pediatric)
+# ---------------------------------------
+markers_by_type <- list(
+  "Airway ciliated" = c("FOXJ1","TPPP3","PIFO","DNAI1","DNAH5"),
+  "Airway basal"    = c("KRT5","KRT14","TP63","KRT17","KRT6A"),
+  "Airway club"     = c("SCGB1A1","SCGB3A1","MUC1","MUC20"),
+  "AT1"             = c("AGER","PDPN","CLDN18"),
+  "AT2"             = c("SFTPC","SFTPA1","SFTPB","SLC34A2"),
+  "Goblet/mucous"   = c("MUC5B","MUC5AC","SPDEF"),
+  "Tuft-like"       = c("POU2F3","TRPM5","ASCL2")
+)
+markers_all <- unique(intersect(unlist(markers_by_type), common_genes))
+Idents(sce) <- ref_label_col
+Idents(query) <- "refaligned_celltype2"
+sce_avg  <- AverageExpression(sce, features = markers_all, assays = "RNA")$RNA %>% as.data.frame()
+query_avg <- AverageExpression(query, features = markers_all, assays = "RNA")$RNA %>% as.data.frame()
+sce_avg  <- sce_avg[markers_all, intersect(colnames(sce_avg), common_types), drop = FALSE]
+query_avg <- query_avg[markers_all, intersect(colnames(query_avg), common_types), drop = FALSE]
+zscore <- function(m) t(scale(t(as.matrix(m))))
+sce_z <- zscore(sce_avg)
+qry_z <- zscore(query_avg)
+ht1 <- Heatmap(
+  sce_z, name = "Z score",
+  col = colorRamp2(c(-2,0,2), c("#2166AC","white","#B2182B")),
+  cluster_rows = TRUE, cluster_columns = TRUE,
+  column_title = "Adult lethal COVID-19", row_names_gp = gpar(fontsize = 8)
+)
+ht2 <- Heatmap(
+  qry_z, name = "Z score",
+  col = colorRamp2(c(-2,0,2), c("#2166AC","white","#B2182B")),
+  cluster_rows = TRUE, cluster_columns = TRUE,
+  column_title = "Pediatric ARDS (mapped)", row_names_gp = gpar(fontsize = 8)
+)
+pdf("results/adult_covid_atlas/figures/FigS12_marker_heatmap_adult.pdf", width = 11, height = 8); draw(ht1); dev.off()
+pdf("results/adult_covid_atlas/figures/FigS12_marker_heatmap_pediatric.pdf", width = 11, height = 8); draw(ht2); dev.off()
+
+MakeDot <- function(obj, group.by, features){
+  DotPlot(obj, features = features, group.by = group.by, cols = c("#2166AC","#B2182B")) +
+    RotatedAxis() + theme_bw()
+}
+p_dot_sce <- MakeDot(sce, ref_label_col, markers_all) +
+  ggtitle("Adult") + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+p_dot_qry <- MakeDot(query, "refaligned_celltype2", markers_all) +
+  ggtitle("Pediatric (mapped)") + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+ggsave("results/adult_covid_atlas/figures/FigS12_markers_dotplot_pair.pdf", p_dot_sce + p_dot_qry, width = 14, height = 8, dpi = 300)
+
+# ---------------------------------------
+# 4) Key marker FeaturePlot on each UMAP
+# ---------------------------------------
+feat_list <- intersect(c("AGER","PDPN","SFTPC","FOXJ1","SCGB1A1","KRT17","MUC5B"), common_genes)
+p_feat_adult <- FeaturePlot(sce, features = feat_list, reduction = "umap", order = TRUE, cols = c("lightgrey","red")) +
+  patchwork::plot_layout(ncol = 3) + plot_annotation(title = "Adult lethal COVID-19 - key markers")
+ggsave("results/adult_covid_atlas/figures/FigS12_FeaturePlot_adult.pdf", p_feat_adult, width = 12, height = 10, dpi = 300)
+
+target_for_ped <- if (exists("total_sce")) total_sce else query
+p_feat_ped <- FeaturePlot(target_for_ped, features = feat_list, reduction = "umap", order = TRUE, cols = c("lightgrey","red")) +
+  patchwork::plot_layout(ncol = 3) + plot_annotation(title = "Pediatric ARDS - key markers (mapped)")
+ggsave("results/adult_covid_atlas/figures/FigS12_FeaturePlot_pediatric.pdf", p_feat_ped, width = 12, height = 10, dpi = 300)
+
+# ---------------------------------------
+# 5) Proportions by sample/group within each cohort
+# ---------------------------------------
+make_props <- function(obj, label_col = "celltype2", sample_col = "orig.ident", group_col = "group"){
+  md <- obj@meta.data %>%
+    tibble::rownames_to_column("cell") %>%
+    dplyr::mutate(
+      label  = as.character(.data[[label_col]]),
+      sample = as.character(.data[[sample_col]]),
+      group  = as.character(.data[[group_col]])
+    ) %>%
+    dplyr::select(cell, label, sample, group) %>%
+    dplyr::filter(!is.na(label), !is.na(sample), !is.na(group))
+  tab <- md %>% dplyr::count(sample, group, label, name = "n") %>%
+    dplyr::group_by(sample) %>% dplyr::mutate(n_tot = sum(n), prop = n / n_tot) %>%
+    dplyr::ungroup()
+  tab
+}
+
+# If pediatric groups are CC / ARDS_LIVE / ARDS_DEATH, optionally collapse for a two-level comparison
+if (!("group1" %in% colnames(query@meta.data))) {
+  query@meta.data <- query@meta.data %>%
+    mutate(group1 = dplyr::case_when(group %in% c("ARDS_LIVE","ARDS_DEATH") ~ "ARDS", TRUE ~ as.character(group)))
+}
+query@meta.data$group2 <- query@meta.data$group
+query@meta.data$group <- query@meta.data$group1
+
+# Adult proportions (Control vs COVID-19)
+sample_id_adult <- if ("donor_id" %in% colnames(sce@meta.data)) "donor_id" else "orig.ident"
+props_adult <- make_props(sce, label_col = ref_label_col, sample_col = sample_id_adult, group_col = "group") %>%
+  dplyr::filter(label %in% common_types)
+# Pediatric proportions (e.g., CC vs ARDS)
+props_ped <- make_props(query, label_col = "refaligned_celltype2", sample_col = "orig.ident", group_col = "group") %>%
+  dplyr::filter(label %in% common_types)
+
+p_prop_adult <- props_adult %>%
+  ggplot(aes(x = group, y = prop, fill = group)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.5) +
+  geom_jitter(width = 0.15, size = 0.7, alpha = 0.6) +
+  facet_wrap(~ label, scales = "free_y") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  theme_bw() + labs(title = "Adult lethal COVID-19", x = "", y = "Proportion (by sample)") +
+  theme(legend.position = "none")
+ggsave("results/adult_covid_atlas/figures/FigS12_props_adult.pdf", p_prop_adult, width = 12, height = 7, dpi = 300)
+
+p_prop_ped <- props_ped %>%
+  ggplot(aes(x = group, y = prop, fill = group)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.5) +
+  geom_jitter(width = 0.15, size = 0.7, alpha = 0.6) +
+  facet_wrap(~ label, scales = "free_y") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  theme_bw() + labs(title = "Pediatric ARDS", x = "", y = "Proportion (by sample)") +
+  theme(legend.position = "none")
+ggsave("results/adult_covid_atlas/figures/FigS12_props_pediatric.pdf", p_prop_ped, width = 12, height = 7, dpi = 300)
+
+test_props <- function(tab){
+  tab %>% group_by(label) %>% rstatix::kruskal_test(prop ~ group) %>% rstatix::adjust_pvalue(method = "BH")
+}
+stats_adult <- test_props(props_adult)
+stats_ped   <- test_props(props_ped)
+write_csv(stats_adult, "results/adult_covid_atlas/tables/FigS12_stats_proportions_adult.csv")
+write_csv(stats_ped,   "results/adult_covid_atlas/tables/FigS12_stats_proportions_pediatric.csv")
+
+# ---------------------------------------
+# 6) Fibroblast-focused panels (CTHRC1+ focus)
+# ---------------------------------------
+fibroblast_markers <- intersect(c("CTHRC1","COL1A1","COL3A1","ACTA2","PDGFRA","PDGFRB"), common_genes)
+umap_theme <- theme(
+  panel.grid = element_blank(), panel.background = element_blank(), panel.border = element_blank(),
+  axis.line = element_line(colour = "black", size = 0.5), axis.ticks = element_line(colour = "black"),
+  axis.title = element_text(size = 12), axis.text = element_text(size = 10)
+)
+# Adult CTHRC1+ highlight on UMAP
+if ("CTHRC1" %in% rownames(sce)) {
+  p_fibro_sce_umap <- DimPlot(
+    sce, reduction = "umap", group.by = ref_label_col,
+    cells.highlight = WhichCells(sce, expression = CTHRC1 > 3),
+    cols.highlight = "red", label = FALSE, repel = TRUE, pt.size = 0.05
+  ) + ggtitle("Adult lethal COVID-19 - Fibroblasts (CTHRC1+)") + umap_theme
+  ggsave("results/adult_covid_atlas/figures/FigS12_Fibroblast_UMAP_adult.pdf", p_fibro_sce_umap, width = 7, height = 6, dpi = 300)
+}
+p_fibro_sce_features <- FeaturePlot(
+  sce, features = fibroblast_markers, reduction = "umap",
+  order = TRUE, cols = c("lightgrey","red"), pt.size = 0.05
+) + umap_theme + patchwork::plot_layout(ncol = 3) + ggtitle("Adult lethal COVID-19 - Fibroblast markers")
+ggsave("results/adult_covid_atlas/figures/FigS12_Fibroblast_FeaturePlot_adult.pdf", p_fibro_sce_features, width = 12, height = 7, dpi = 300)
+
+# Pediatric: use total_sce if provided, else query
+ped_obj <- if (exists("total_sce")) total_sce else query
+if ("refaligned_celltype2" %in% colnames(ped_obj@meta.data)) {
+  if ("CTHRC1" %in% rownames(query)) {
+    p_fibro_query_umap <- DimPlot(
+      ped_obj, reduction = "umap", group.by = "refaligned_celltype2",
+      cells.highlight = WhichCells(query, expression = CTHRC1 > 1),
+      cols.highlight = "red", label = FALSE, repel = TRUE, pt.size = 0.6
+    ) + ggtitle("Pediatric ARDS - Fibroblasts (CTHRC1+)") + umap_theme
+    ggsave("results/adult_covid_atlas/figures/FigS12_Fibroblast_UMAP_pediatric.pdf", p_fibro_query_umap, width = 7, height = 6, dpi = 300)
+  }
+  p_fibro_query_features <- FeaturePlot(
+    ped_obj, features = fibroblast_markers, reduction = "umap",
+    order = TRUE, cols = c("lightgrey","red"), pt.size = 0.6
+  ) + umap_theme + patchwork::plot_layout(ncol = 3) + ggtitle("Pediatric ARDS - Fibroblast markers")
+  ggsave("results/adult_covid_atlas/figures/FigS12_Fibroblast_FeaturePlot_pediatric.pdf", p_fibro_query_features, width = 12, height = 7, dpi = 300)
+}
+
+# Proportion of CTHRC1+ cells by sample/group (adult and pediatric)
+# Create logical flags if not present
+if (!("CTHRC1_pos" %in% colnames(sce@meta.data)) && "CTHRC1" %in% rownames(sce)) {
+  sce$CTHRC1_pos <- FetchData(sce, "CTHRC1")[,1] > 3
+}
+if (!("CTHRC1_pos" %in% colnames(query@meta.data)) && "CTHRC1" %in% rownames(query)) {
+  query$CTHRC1_pos <- FetchData(query, "CTHRC1")[,1] > 1
+}
+fibro_props_adult <- make_props(
+  sce, label_col = "CTHRC1_pos", sample_col = sample_id_adult, group_col = "group"
+) %>% dplyr::filter(label == "TRUE")
+query$group1 <- factor(query$group1, levels = c("CC","ARDS"))
+fibro_props_ped <- make_props(
+  query, label_col = "CTHRC1_pos", sample_col = "orig.ident", group_col = "group1"
+) %>% dplyr::filter(label == "TRUE")
+
+p_fibro_prop_adult <- fibro_props_adult %>%
+  ggplot(aes(x = group, y = prop, fill = group)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.5) +
+  geom_jitter(width = 0.15, size = 0.7, alpha = 0.6) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  theme_bw() + labs(title = "Adult lethal COVID-19 - CTHRC1+ fibroblasts", x = "", y = "Proportion") +
+  theme(legend.position = "none")
+ggsave("results/adult_covid_atlas/figures/FigS12_Fibroblast_Proportions_adult.pdf", p_fibro_prop_adult, width = 6, height = 3, dpi = 300)
+
+p_fibro_prop_ped <- fibro_props_ped %>%
+  ggplot(aes(x = group, y = prop, fill = group)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.5) +
+  geom_jitter(width = 0.15, size = 0.7, alpha = 0.6) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  theme_bw() + labs(title = "Pediatric ARDS - CTHRC1+ fibroblasts", x = "", y = "Proportion") +
+  theme(legend.position = "none")
+ggsave("results/adult_covid_atlas/figures/FigS12_Fibroblast_Proportions_pediatric.pdf", p_fibro_prop_ped, width = 6, height = 3, dpi = 300)
+
+# Fibroblast subtype marker panels
+fb_markers_by_type <- list(
+  "Alveolar FB"                  = c("LGR5","PDGFRA","PDGFRB","COL4A1","COL4A2"),
+  "Adventitial FB"               = c("DCN","COL1A1","COL3A1","LUM","THY1"),
+  "Pathological FB"              = c("CTHRC1","COL1A1","COL3A1","FN1","POSTN"),
+  "Intermediate pathological FB" = c("COL1A1","COL3A1","FN1","ACTA2"),
+  "Other FB"                     = c("COL6A1","COL6A2","COL6A3"),
+  "Pericytes"                    = c("RGS5","PDGFRB","ACTA2","MYH11"),
+  "Vascular smooth muscle"       = c("MYH11","ACTA2","CNN1","TAGLN"),
+  "Airway smooth muscle"         = c("ACTA2","MYH11","DES","TAGLN"),
+  "Mesothelial FB"               = c("WT1","UPK3B","CALB2","MSLN")
+)
+fb_all <- unique(intersect(unlist(fb_markers_by_type), common_genes))
+Idents(sce) <- "celltype2"
+Idents(query) <- "refaligned_celltype2"
+sce_avg2  <- AverageExpression(sce, features = fb_all, assays = "RNA")$RNA %>% as.data.frame()
+query_avg2 <- AverageExpression(query, features = fb_all, assays = "RNA")$RNA %>% as.data.frame()
+sce_avg2  <- sce_avg2[fb_all, intersect(colnames(sce_avg2), common_types), drop = FALSE]
+query_avg2 <- query_avg2[fb_all, intersect(colnames(query_avg2), common_types), drop = FALSE]
+sce_z2 <- zscore(sce_avg2)
+qry_z2 <- zscore(query_avg2)
+ht_fb1 <- Heatmap(
+  sce_z2, name = "Z score",
+  col = colorRamp2(c(-2,0,2), c("#2166AC","white","#B2182B")),
+  cluster_rows = TRUE, cluster_columns = TRUE, column_title = "Adult lethal COVID-19", row_names_gp = gpar(fontsize = 8)
+)
+ht_fb2 <- Heatmap(
+  qry_z2, name = "Z score",
+  col = colorRamp2(c(-2,0,2), c("#2166AC","white","#B2182B")),
+  cluster_rows = TRUE, cluster_columns = TRUE, column_title = "Pediatric ARDS (mapped)", row_names_gp = gpar(fontsize = 8)
+)
+pdf("results/adult_covid_atlas/figures/FigS12_FIBmarker_heatmap_adult.pdf", width = 11, height = 8); draw(ht_fb1); dev.off()
+pdf("results/adult_covid_atlas/figures/FigS12_FIBmarker_heatmap_pediatric.pdf", width = 11, height = 8); draw(ht_fb2); dev.off()
+
+# ---------------------------------------
+# 7) Path 2 — Optional integrated embedding (visualization only)
+# ---------------------------------------
+Idents(sce) <- "celltype2"
+Idents(query) <- "refaligned_celltype2"
+features_int <- SelectIntegrationFeatures(object.list = list(sce, query), nfeatures = 3000)
+sce <- ScaleData(sce, features = features_int, verbose = FALSE)
+query <- ScaleData(query, features = features_int, verbose = FALSE)
+anchors_int <- FindIntegrationAnchors(object.list = list(sce, query), anchor.features = features_int, dims = 1:30)
+integrated <- IntegrateData(anchorset = anchors_int, dims = 1:30)
+DefaultAssay(integrated) <- "integrated"
+integrated <- ScaleData(integrated, verbose = FALSE)
+integrated <- RunPCA(integrated, npcs = 50, verbose = FALSE)
+integrated <- RunUMAP(integrated, dims = 1:30)
+integrated$dataset <- ifelse(colnames(integrated) %in% colnames(sce), "Adult", "Pediatric")
+unified_label <- rep(NA_character_, ncol(integrated))
+unified_label[colnames(sce)]   <- sce@meta.data[[ref_label_col]][colnames(sce)]
+unified_label[colnames(query)] <- query$refaligned_celltype2[match(colnames(query), colnames(query))]
+integrated$unified_label <- unified_label
+p_int1 <- DimPlot(integrated, group.by = "dataset", reduction = "umap") + ggtitle("Integrated UMAP - dataset")
+p_int2 <- DimPlot(integrated, group.by = "unified_label", label = TRUE, repel = TRUE, reduction = "umap") +
+  ggtitle("Integrated UMAP - unified labels")
+ggsave("results/adult_covid_atlas/figures/FigS12_integrated_umap.pdf", p_int1 + p_int2, width = 12, height = 6, dpi = 300)
+
+# ---------------------------------------
+# 8) Save key outputs
+# ---------------------------------------
+saveRDS(list(
+  query_mapped_meta = query@meta.data,
+  sce_meta = sce@meta.data,
+  common_types = common_types,
+  stats_adult = stats_adult,
+  stats_ped = stats_ped
+), file = "results/adult_covid_atlas/FigS12_meta_and_stats.rds")
