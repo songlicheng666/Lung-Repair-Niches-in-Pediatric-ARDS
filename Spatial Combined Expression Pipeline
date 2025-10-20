@@ -1,0 +1,265 @@
+# Spatial Combined Expression Pipeline
+# Requirements: Seurat, ggplot2, patchwork, dplyr, tidyr, pheatmap
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(ggplot2)
+  library(patchwork)
+  library(dplyr)
+  library(tidyr)
+  library(pheatmap)
+})
+
+# Optional: set working directory (commented to avoid locale issues)
+# setwd("D:/child_spatial_transcriptomics/combined_expression")
+
+# Check sample distribution
+if ("orig.ident" %in% colnames(Spatial_integrated@meta.data)) {
+  print(table(Spatial_integrated$orig.ident))
+} else {
+  message("Metadata column 'orig.ident' not found.")
+}
+
+# Set default assay to celltypeprops if available
+if ("celltypeprops" %in% names(Spatial_integrated@assays)) {
+  DefaultAssay(Spatial_integrated) <- "celltypeprops"
+} else {
+  stop("Assay 'celltypeprops' not found in Spatial_integrated.")
+}
+
+# Extract prediction matrix
+prediction_data <- GetAssayData(Spatial_integrated, assay = "celltypeprops", slot = "data")
+
+# Helper: global Min-Max normalization (NA-safe)
+min_max_normalize_global <- function(x) {
+  x_min <- min(x, na.rm = TRUE)
+  x_max <- max(x, na.rm = TRUE)
+  if (!is.finite(x_min) || !is.finite(x_max)) {
+    return(rep(0, length(x)))
+  }
+  if (x_max == x_min) {
+    return(rep(0, length(x)))
+  } else {
+    return((x - x_min) / (x_max - x_min))
+  }
+}
+
+# ---------- Composite: Alveolar signature ----------
+alveolar_features <- c("AT1", "AT2", "FABP4-MAC", "Alveolar fibroblast", "capilary-EC", "AT2TOAT1")
+
+missing_alv <- setdiff(alveolar_features, rownames(prediction_data))
+if (length(missing_alv) > 0) {
+  warning(paste("Missing alveolar features:", paste(missing_alv, collapse = ", ")))
+}
+# Safely get vectors for existing features
+get_feat <- function(mat, f) if (f %in% rownames(mat)) mat[f, ] else rep(0, ncol(mat))
+
+at1_expr        <- get_feat(prediction_data, "AT1")
+at2_expr        <- get_feat(prediction_data, "AT2")
+FABP4_expr      <- get_feat(prediction_data, "FABP4-MAC")
+alvFIB_expr     <- get_feat(prediction_data, "Alveolar fibroblast")
+EC_expr         <- get_feat(prediction_data, "capilary-EC")
+AT2TOAT1_expr   <- get_feat(prediction_data, "AT2TOAT1")
+
+at1_norm      <- min_max_normalize_global(at1_expr)
+at2_norm      <- min_max_normalize_global(at2_expr)
+FABP4_norm    <- min_max_normalize_global(FABP4_expr)
+alvFIB_norm   <- min_max_normalize_global(alvFIB_expr)
+EC_norm       <- min_max_normalize_global(EC_expr)
+AT2TOAT1_norm <- min_max_normalize_global(AT2TOAT1_expr)
+
+Spatial_integrated[["ALV_normalized"]] <- at1_norm + at2_norm + FABP4_norm + alvFIB_norm + EC_norm + AT2TOAT1_norm
+message("Added 'ALV_normalized' composite feature.")
+print(head(Spatial_integrated[["ALV_normalized"]]))
+
+# Save objects used for plotting
+save(Spatial_integrated, prediction_data, file = "combined_expression_data_ALV.Rdata")
+
+# ---------- Composite: Injury signature ----------
+injury_features <- c("Myofibroblast", "CLUBTOAT2", "FCN1-MAC", "SPP1-MAC", "classical-mon", "mature-neu")
+
+missing_inj <- setdiff(injury_features, rownames(prediction_data))
+if (length(missing_inj) > 0) {
+  warning(paste("Missing injury features:", paste(missing_inj, collapse = ", ")))
+}
+
+Myofibroblast_expr <- get_feat(prediction_data, "Myofibroblast")
+CLUBTOAT2_expr     <- get_feat(prediction_data, "CLUBTOAT2")
+FCN1_expr          <- get_feat(prediction_data, "FCN1-MAC")
+SPP1_expr          <- get_feat(prediction_data, "SPP1-MAC")
+MON_expr           <- get_feat(prediction_data, "classical-mon")
+NEU_expr           <- get_feat(prediction_data, "mature-neu")
+
+Myofibroblast_norm <- min_max_normalize_global(Myofibroblast_expr)
+CLUBTOAT2_norm     <- min_max_normalize_global(CLUBTOAT2_expr)
+FCN1_norm          <- min_max_normalize_global(FCN1_expr)
+SPP1_norm          <- min_max_normalize_global(SPP1_expr)
+MON_norm           <- min_max_normalize_global(MON_expr)
+NEU_norm           <- min_max_normalize_global(NEU_expr)
+
+Spatial_integrated[["Injury_normalized"]] <- Myofibroblast_norm + CLUBTOAT2_norm + FCN1_norm + SPP1_norm + MON_norm + NEU_norm
+message("Added 'Injury_normalized' composite feature.")
+print(head(Spatial_integrated[["Injury_normalized"]]))
+
+save(Spatial_integrated, prediction_data, file = "combined_expression_data_Injury.Rdata")
+
+# ---------- Unified color scale helpers ----------
+calculate_global_limits <- function(seurat_obj, feature) {
+  vals <- FetchData(seurat_obj, vars = feature)[[feature]]
+  c(0, as.numeric(quantile(vals, probs = 0.95, na.rm = TRUE)))
+}
+
+plot_unified_spatial <- function(feature, crop_status = FALSE) {
+  # limits computed but not directly used because min/max.cutoff are set to 0/1 for normalized composites
+  limits <- calculate_global_limits(Spatial_integrated, feature)
+  p <- SpatialFeaturePlot(
+    Spatial_integrated,
+    features = feature,
+    pt.size.factor = 6000,
+    min.cutoff = 0,
+    max.cutoff = 1,
+    crop = crop_status
+  )
+  return(p)
+}
+
+# ---------- Plot composites ----------
+pdf("ALV_normalized.pdf", width = 9, height = 5)
+print(plot_unified_spatial("ALV_normalized", crop_status = TRUE))
+dev.off()
+
+pdf("Injury_normalized.pdf", width = 9, height = 5)
+print(plot_unified_spatial("Injury_normalized", crop_status = TRUE))
+dev.off()
+
+# ---------- Statistical comparison (two-sample t-test) ----------
+# ALV_normalized
+if ("orig.ident" %in% colnames(Spatial_integrated@meta.data)) {
+  alv_df <- FetchData(Spatial_integrated, vars = c("ALV_normalized", "orig.ident"))
+  print(head(alv_df))
+  t_res_alv <- try(t.test(ALV_normalized ~ orig.ident, data = alv_df), silent = TRUE)
+  print(t_res_alv)
+
+  alv_violin <- ggplot(alv_df, aes(x = orig.ident, y = ALV_normalized, fill = orig.ident)) +
+    geom_violin(trim = FALSE) +
+    geom_boxplot(width = 0.1, outlier.shape = NA) +
+    labs(title = "ALV_normalized", x = "Sample", y = "ALV_normalized") +
+    scale_fill_manual(values = c("DEATH" = "#E41A1C", "LIVE" = "#377EB8")) +
+    theme(
+      panel.background = element_blank(),
+      panel.grid = element_blank(),
+      axis.line = element_line(color = "black"),
+      axis.ticks = element_line(color = "black"),
+      axis.text = element_text(color = "black"),
+      plot.title = element_text(hjust = 0.5)
+    )
+
+  print(alv_violin)
+  ggsave("ALV_normalized_violin_plot.pdf", alv_violin, width = 4, height = 4)
+} else {
+  message("'orig.ident' missing; skipping ALV t-test and violin.")
+}
+
+# Injury_normalized
+if ("orig.ident" %in% colnames(Spatial_integrated@meta.data)) {
+  inj_df <- FetchData(Spatial_integrated, vars = c("Injury_normalized", "orig.ident"))
+  print(head(inj_df))
+  t_res_inj <- try(t.test(Injury_normalized ~ orig.ident, data = inj_df), silent = TRUE)
+  print(t_res_inj)
+
+  inj_violin <- ggplot(inj_df, aes(x = orig.ident, y = Injury_normalized, fill = orig.ident)) +
+    geom_violin(trim = FALSE) +
+    geom_boxplot(width = 0.1, outlier.shape = NA) +
+    labs(title = "Injury_normalized", x = "Sample", y = "Injury_normalized") +
+    scale_fill_manual(values = c("DEATH" = "#E41A1C", "LIVE" = "#377EB8")) +
+    theme(
+      panel.background = element_blank(),
+      panel.grid = element_blank(),
+      axis.line = element_line(color = "black"),
+      axis.ticks = element_line(color = "black"),
+      axis.text = element_text(color = "black"),
+      plot.title = element_text(hjust = 0.5)
+    )
+
+  print(inj_violin)
+  ggsave("Injury_normalized_violin_plot.pdf", inj_violin, width = 4, height = 4)
+} else {
+  message("'orig.ident' missing; skipping Injury t-test and violin.")
+}
+
+# ---------- Batch feature plotting ----------
+features <- c("AT2", "AT1", "CLUBTOAT2", "CLUB", "FABP4-MAC", "FCN1-MAC")
+for (feature in features) {
+  if (feature %in% rownames(prediction_data)) {
+    pdf(paste0(feature, ".pdf"), width = 9, height = 5)
+    crop_needed <- feature %in% c("FABP4-MAC", "FCN1-MAC")
+    print(plot_unified_spatial(feature, crop_status = crop_needed))
+    dev.off()
+  } else {
+    message(paste("Feature", feature, "not found; skipping plot."))
+  }
+}
+
+# ---------- Region-level heatmap ----------
+# Requires metadata columns: regionLevel, orig.ident
+if (all(c("regionLevel", "orig.ident") %in% colnames(Spatial_integrated@meta.data))) {
+  heat_df <- FetchData(
+    Spatial_integrated,
+    vars = c("regionLevel", "orig.ident", "Injury_normalized", "ALV_normalized")
+  )
+  print(head(heat_df))
+
+  heatmat_df <- heat_df %>%
+    group_by(regionLevel, orig.ident) %>%
+    summarise(
+      Injury_mean = mean(Injury_normalized, na.rm = TRUE),
+      ALV_mean = mean(ALV_normalized, na.rm = TRUE),
+      .groups = "drop_last"
+    ) %>%
+    pivot_wider(
+      names_from = orig.ident,
+      values_from = c(Injury_mean, ALV_mean)
+    )
+
+  print(heatmat_df)
+
+  # Remove unwanted region label (previously 'airleak')
+  if ("regionLevel" %in% colnames(heatmat_df)) {
+    heatmat_df <- heatmat_df[heatmat_df$regionLevel != "airleak", ]
+    rownames(heatmat_df) <- heatmat_df$regionLevel
+  } else {
+    stop("Column 'regionLevel' missing in heatmap data.")
+  }
+
+  # Prepare matrix
+  heatmat_df <- as.data.frame(heatmat_df)
+  heatmat_numeric <- as.data.frame(lapply(heatmat_df[, -1, drop = FALSE], as.numeric))
+  heatmat_numeric[is.na(heatmat_numeric)] <- 0
+
+  heatmat_scaled <- t(apply(heatmat_numeric, 1, function(v) {
+    v_scaled <- scale(v)
+    v_scaled[is.na(v_scaled)] <- 0
+    as.numeric(v_scaled)
+  }))
+  rownames(heatmat_scaled) <- rownames(heatmat_df)
+  colnames(heatmat_scaled) <- colnames(heatmat_numeric)
+
+  pdf("Heatmap_Injury_ALV_normalized.pdf", width = 4, height = 5)
+  pheatmap(
+    heatmat_scaled,
+    cluster_rows = TRUE,
+    cluster_cols = TRUE,
+    color = colorRampPalette(c("blue", "white", "red"))(100),
+    main = "Heatmap of Injury_normalized and ALV_normalized",
+    fontsize_row = 10,
+    fontsize_col = 10,
+    show_rownames = TRUE,
+    show_colnames = TRUE,
+    border_color = NA
+  )
+  dev.off()
+} else {
+  message("Missing 'regionLevel' or 'orig.ident' in metadata; skipping heatmap.")
+}
+
+message("Pipeline completed successfully.")
