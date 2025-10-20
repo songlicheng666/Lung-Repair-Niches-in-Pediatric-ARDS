@@ -1,0 +1,591 @@
+# Spatial RCTD Integration and Cross-Method Validation Pipeline
+# Purpose: Address reviewer comments with transparent QC, robust RCTD deconvolution,
+#          cross-method comparison (RCTD vs NNLS), effect sizes, ROI analysis, and summaries.
+# Requirements: Seurat (v5 recommended), ggplot2, dplyr, patchwork, RColorBrewer, viridis,
+#               spacexr, Matrix, gridExtra, corrplot, ComplexHeatmap, pheatmap, tidyr
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(ggplot2)
+  library(dplyr)
+  library(patchwork)
+  library(RColorBrewer)
+  library(viridis)
+  library(spacexr)   # RCTD
+  library(Matrix)
+  library(gridExtra)
+  library(corrplot)
+  library(ComplexHeatmap)
+  library(pheatmap)
+  library(tidyr)
+})
+
+# Quick object glimpse (if present)
+if (exists("Spatial_integrated")) {
+  message("Assays in Spatial_integrated:")
+  suppressWarnings(print(utils::str(Spatial_integrated@assays)))
+  message("Images in Spatial_integrated:")
+  suppressWarnings(print(utils::str(Spatial_integrated@images)))
+  if ("orig.ident" %in% colnames(Spatial_integrated@meta.data)) {
+    print(table(Spatial_integrated$orig.ident))
+  }
+} else {
+  stop("Spatial_integrated object not found.")
+}
+if (exists("total_sce")) {
+  message("Assays in total_sce:")
+  suppressWarnings(print(utils::str(total_sce@assays)))
+  if ("refaligned_celltype2" %in% colnames(total_sce@meta.data)) {
+    print(table(total_sce$refaligned_celltype2))
+  }
+  print(head(total_sce@meta.data))
+  if ("group" %in% colnames(total_sce@meta.data)) {
+    print(table(total_sce$group))
+  }
+} else {
+  warning("total_sce object not found. RCTD reference preparation will fail.")
+}
+
+# =============================================================================
+# 1. Spatial QC and basic statistics (transparency)
+# =============================================================================
+spatial_qc_stats <- function(spatial_obj) {
+  stats_list <- list()
+  image_names <- names(spatial_obj@images)
+  if (length(image_names) == 0) {
+    warning("No images found in spatial object.")
+    return(data.frame())
+  }
+  for (sample in image_names) {
+    coords <- spatial_obj@images[[sample]]@coordinates
+    spots_total <- nrow(coords)
+    spots_in_data <- sum(spatial_obj$orig.ident == sample)
+    sample_cells <- WhichCells(spatial_obj, expression = orig.ident == sample)
+    nFeature <- spatial_obj$nFeature_Spatial[sample_cells]
+    nCount <- spatial_obj$nCount_Spatial[sample_cells]
+    stats_list[[sample]] <- data.frame(
+      Sample = sample,
+      Total_spots = spots_total,
+      Spots_with_data = spots_in_data,
+      Mean_genes = mean(nFeature, na.rm = TRUE),
+      Median_genes = median(nFeature, na.rm = TRUE),
+      Mean_UMI = mean(nCount, na.rm = TRUE),
+      Median_UMI = median(nCount, na.rm = TRUE),
+      Min_genes = min(nFeature, na.rm = TRUE),
+      Max_genes = max(nFeature, na.rm = TRUE)
+    )
+  }
+  do.call(rbind, stats_list)
+}
+
+qc_stats <- spatial_qc_stats(Spatial_integrated)
+message("Spatial QC statistics:")
+print(qc_stats)
+
+p1 <- VlnPlot(Spatial_integrated, features = "nFeature_Spatial",
+              group.by = "orig.ident", pt.size = 0) +
+  labs(title = "Genes per Spot", x = "Sample") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p2 <- VlnPlot(Spatial_integrated, features = "nCount_Spatial",
+              group.by = "orig.ident", pt.size = 0) +
+  labs(title = "UMI per Spot", x = "Sample") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p3 <- SpatialFeaturePlot(Spatial_integrated, features = "nFeature_Spatial",
+                         images = names(Spatial_integrated@images), ncol = length(Spatial_integrated@images),
+                         pt.size.factor = 6000) +
+  plot_annotation(title = "Spatial Distribution of Gene Counts")
+
+qc_plot <- (p1 | p2) / p3
+print(qc_plot)
+ggsave("Fig_S_Spatial_QC_metrics.pdf", qc_plot, width = 9, height = 10)
+
+# =============================================================================
+# 2. RCTD deconvolution analysis
+# =============================================================================
+prepare_reference_for_rctd <- function(sc_obj, celltype_col = "celltype2", min_cells = 50) {
+  if (!(celltype_col %in% colnames(sc_obj@meta.data))) {
+    stop(sprintf("Missing cell type column in sc_obj: %s", celltype_col))
+  }
+  cell_counts <- table(sc_obj[[celltype_col]][, 1, drop = TRUE])
+  keep_types <- names(cell_counts)[cell_counts >= min_cells]
+  sc_subset <- subset(sc_obj, subset = (!!as.name(celltype_col)) %in% keep_types)
+  if (!("RNA" %in% names(sc_subset@assays))) stop("RNA assay not found in sc object.")
+  if (!("layers" %in% slotNames(sc_subset[["RNA"]]))) stop("RNA assay has no layers; need counts via layers.")
+  counts <- as.matrix(sc_subset[["RNA"]]@layers$counts)
+  rownames(counts) <- rownames(sc_subset[["RNA"]])
+  colnames(counts) <- colnames(sc_subset)
+  cell_types <- sc_subset[[celltype_col]][, 1, drop = TRUE]
+  names(cell_types) <- colnames(sc_subset)
+  reference <- Reference(counts, cell_types)
+  return(reference)
+}
+
+run_rctd_analysis_corrected <- function(spatial_obj, reference, sample_name) {
+  message(sprintf("Starting corrected RCTD for sample: %s", sample_name))
+  sample_spots <- WhichCells(spatial_obj, expression = orig.ident == sample_name)
+  message(sprintf("Total spots in sample: %d", length(sample_spots)))
+  if (!(sample_name %in% names(spatial_obj@images))) stop("Image not found for sample: ", sample_name)
+  coords <- spatial_obj@images[[sample_name]]@coordinates
+  coord_cells <- rownames(coords)
+  message(sprintf("Spots with coordinates: %d", length(coord_cells)))
+  valid_cells <- intersect(sample_spots, coord_cells)
+  message(sprintf("Valid spots used: %d", length(valid_cells)))
+  if (length(valid_cells) == 0) stop("No valid spots with both counts and coordinates.")
+  full_counts <- LayerData(spatial_obj, assay = "Spatial", layer = "counts")
+  if (is.null(full_counts)) stop("Spatial counts layer not found.")
+  sample_counts <- full_counts[, valid_cells, drop = FALSE]
+  message(sprintf("Counts matrix dim: %s", paste(dim(sample_counts), collapse = "x")))
+  sample_coords <- coords[valid_cells, c("imagerow", "imagecol"), drop = FALSE]
+  colnames(sample_coords) <- c("x", "y")
+  gene_sums <- Matrix::rowSums(sample_counts)
+  expressed_genes <- gene_sums > 0
+  sample_counts_filtered <- sample_counts[expressed_genes, , drop = FALSE]
+  if (prod(dim(sample_counts_filtered)) > 5e7) {
+    message("Large matrix; converting via as(<dgCMatrix>, 'matrix')")
+    sample_matrix <- as(sample_counts_filtered, "matrix")
+  } else {
+    sample_matrix <- as.matrix(sample_counts_filtered)
+  }
+  spatial_rna <- SpatialRNA(sample_coords, sample_matrix)
+  RCTD_obj <- create.RCTD(spatial_rna, reference, max_cores = 1)
+  RCTD_obj <- run.RCTD(RCTD_obj, doublet_mode = "doublet")
+  message(sprintf("Completed RCTD for sample: %s", sample_name))
+  return(RCTD_obj)
+}
+
+message("Preparing RCTD reference...")
+reference <- prepare_reference_for_rctd(total_sce)
+
+rctd_results <- list()
+for (sample in names(Spatial_integrated@images)) {
+  cat("\n================================================\n")
+  message(sprintf("Analyzing sample: %s", sample))
+  cat("================================================\n")
+  tryCatch({
+    rctd_results[[sample]] <- run_rctd_analysis_corrected(Spatial_integrated, reference, sample)
+    message(sprintf("Success: %s", sample))
+    gc()
+  }, error = function(e) {
+    message(sprintf("Failed: %s. Error: %s", sample, e$message))
+  })
+}
+
+extract_rctd_results <- function(rctd_obj, sample_name) {
+  weights <- rctd_obj@results$weights
+  entropy <- apply(weights, 1, function(x) -sum(x * log(x + 1e-10)))
+  max_weight <- apply(weights, 1, max)
+  simpson_index <- apply(weights, 1, function(x) sum(x^2))
+  results_df <- data.frame(
+    spot_id = rownames(weights),
+    sample = sample_name,
+    entropy = entropy,
+    max_weight = max_weight,
+    simpson_index = simpson_index,
+    stringsAsFactors = FALSE
+  )
+  results_df <- cbind(results_df, weights)
+  return(results_df)
+}
+
+rctd_combined_results <- lapply(names(rctd_results), function(s) extract_rctd_results(rctd_results[[s]], s))
+names(rctd_combined_results) <- names(rctd_results)
+rctd_df <- do.call(rbind, rctd_combined_results)
+
+add_rctd_to_seurat <- function(spatial_obj, rctd_df,
+                               prefix = "rctd_",
+                               add_hard_label = TRUE,
+                               min_max_weight = 0) {
+  stopifnot("spot_id" %in% colnames(rctd_df))
+  metric_cols <- c("spot_id","sample","entropy","max_weight","simpson_index")
+  celltype_cols <- setdiff(colnames(rctd_df), metric_cols)
+  rctd_df2 <- rctd_df[rctd_df$spot_id %in% colnames(spatial_obj), , drop = FALSE]
+  rownames(rctd_df2) <- rctd_df2$spot_id
+  spatial_obj@meta.data[rownames(rctd_df2), paste0(prefix, c("entropy","max_weight","simpson"))] <-
+    rctd_df2[, c("entropy","max_weight","simpson_index"), drop = FALSE]
+  wt_df <- rctd_df2[, celltype_cols, drop = FALSE]
+  colnames(wt_df) <- paste0(prefix, celltype_cols)
+  spatial_obj@meta.data[rownames(wt_df), colnames(wt_df)] <- wt_df
+  if (isTRUE(add_hard_label) && length(celltype_cols) > 0) {
+    cm <- as.matrix(rctd_df2[, celltype_cols, drop = FALSE])
+    max_idx <- apply(cm, 1, which.max)
+    max_ct  <- celltype_cols[max_idx]
+    max_val <- cm[cbind(seq_len(nrow(cm)), max_idx)]
+    hard_label <- ifelse(max_val >= min_max_weight, max_ct, NA_character_)
+    spatial_obj@meta.data[rownames(rctd_df2), paste0(prefix, "label")] <- hard_label
+  }
+  return(spatial_obj)
+}
+
+Spatial_integrated <- add_rctd_to_seurat(Spatial_integrated, rctd_df, prefix = "rctd_", add_hard_label = TRUE, min_max_weight = 0.2)
+print(table(Spatial_integrated$rctd_label, Spatial_integrated$orig.ident))
+
+# Uncertainty spatial plots
+pU1 <- SpatialFeaturePlot(Spatial_integrated, features = "rctd_entropy", pt.size.factor = 6000,
+                          images = names(Spatial_integrated@images), ncol = length(Spatial_integrated@images)) +
+  plot_annotation(title = "RCTD Deconvolution Uncertainty (Entropy)")
+pU2 <- SpatialFeaturePlot(Spatial_integrated, features = "rctd_max_weight", pt.size.factor = 6000,
+                          images = names(Spatial_integrated@images), ncol = length(Spatial_integrated@images)) +
+  plot_annotation(title = "RCTD Confidence (Max Weight)")
+uncertainty_plot <- pU1 / pU2
+print(uncertainty_plot)
+ggsave("Fig_S_RCTD_Uncertainty_Spatial.pdf", uncertainty_plot, width = 12, height = 12)
+
+# =============================================================================
+# 3. Spatial expression patterns and cross-sample comparison
+# =============================================================================
+DefaultAssay(Spatial_integrated) <- "Spatial"
+layers_available <- if ("layers" %in% slotNames(Spatial_integrated[["Spatial"]])) names(Spatial_integrated[["Spatial"]]@layers) else character(0)
+
+get_nonzero <- function(mat) {
+  if (is.null(mat) || length(mat) == 0) return(NA_integer_)
+  if (inherits(mat, "dgCMatrix")) length(mat@x) else sum(mat != 0)
+}
+probe_layer <- function(layer_name) {
+  mat <- try(GetAssayData(Spatial_integrated, assay = "Spatial", layer = layer_name), silent = TRUE)
+  if (inherits(mat, "try-error") || is.null(mat)) return(list(ok = FALSE, rows = NA, nz = NA))
+  list(ok = TRUE, rows = nrow(mat), nz = get_nonzero(mat))
+}
+candidate_layers <- unique(c("data", "counts", "scaled", layers_available))
+probe_res <- lapply(candidate_layers, probe_layer)
+names(probe_res) <- candidate_layers
+ok_layers <- names(Filter(function(x) isTRUE(x$ok) && is.finite(x$nz) && !is.na(x$nz) && x$nz > 0, probe_res))
+if (length(ok_layers) == 0) stop("No usable layer found in Spatial assay.")
+preferred_order <- c("data", "counts", setdiff(ok_layers, c("data","counts")))
+use_layer <- preferred_order[preferred_order %in% ok_layers][1]
+
+calculate_cohens_d <- function(spatial_obj, genes,
+                               assay = "Spatial",
+                               data_layer = "data",
+                               group_col = "orig.ident",
+                               group1 = "LIVE",
+                               group2 = "DEATH",
+                               n_bootstrap = 1000,
+                               min_boot_valid = 50) {
+  if (!group_col %in% colnames(spatial_obj@meta.data)) stop(sprintf("Missing group column: %s", group_col))
+  group_vals <- spatial_obj[[group_col]][,1, drop = TRUE]
+  live_cells  <- Cells(spatial_obj)[group_vals == group1]
+  death_cells <- Cells(spatial_obj)[group_vals == group2]
+  if (length(live_cells) < 2 || length(death_cells) < 2) stop("Too few cells in groups.")
+  mat <- GetAssayData(spatial_obj, assay = assay, layer = data_layer)
+  if (is.null(mat) || nrow(mat) == 0) stop("Empty expression matrix.")
+  results <- lapply(genes, function(gene) {
+    if (!(gene %in% rownames(mat))) return(NULL)
+    live_expr  <- as.numeric(mat[gene, live_cells,  drop = TRUE])
+    death_expr <- as.numeric(mat[gene, death_cells, drop = TRUE])
+    if (length(live_expr) < 2 || length(death_expr) < 2) return(NULL)
+    var_live  <- stats::var(live_expr)
+    var_death <- stats::var(death_expr)
+    pooled_sd <- sqrt(((length(live_expr) - 1) * var_live + (length(death_expr) - 1) * var_death) / (length(live_expr) + length(death_expr) - 2))
+    if (!is.finite(pooled_sd) || pooled_sd == 0) return(NULL)
+    cohens_d <- (mean(live_expr) - mean(death_expr)) / pooled_sd
+    bootstrap_d <- replicate(n_bootstrap, {
+      live_b  <- sample(live_expr,  length(live_expr),  replace = TRUE)
+      death_b <- sample(death_expr, length(death_expr), replace = TRUE)
+      var_l_b <- stats::var(live_b)
+      var_d_b <- stats::var(death_b)
+      pooled_b <- sqrt(((length(live_b) - 1) * var_l_b + (length(death_b) - 1) * var_d_b) / (length(live_b) + length(death_b) - 2))
+      if (!is.finite(pooled_b) || pooled_b == 0) return(NA_real_)
+      (mean(live_b) - mean(death_b)) / pooled_b
+    })
+    bootstrap_d <- bootstrap_d[is.finite(bootstrap_d)]
+    if (length(bootstrap_d) < min_boot_valid) return(NULL)
+    ci_lower <- as.numeric(stats::quantile(bootstrap_d, 0.025, names = FALSE))
+    ci_upper <- as.numeric(stats::quantile(bootstrap_d, 0.975, names = FALSE))
+    data.frame(
+      gene = gene,
+      cohens_d = cohens_d,
+      ci_lower = ci_lower,
+      ci_upper = ci_upper,
+      live_mean = mean(live_expr),
+      death_mean = mean(death_expr),
+      live_sd = stats::sd(live_expr),
+      death_sd = stats::sd(death_expr),
+      stringsAsFactors = FALSE
+    )
+  })
+  results <- Filter(Negate(is.null), results)
+  if (length(results) == 0) return(data.frame())
+  do.call(rbind, results)
+}
+
+key_genes <- c("KRT17","SFTPC","SPP1","FABP4","CTHRC1","CHI3L1","MARCO","MMP9")
+mat_for_check <- GetAssayData(Spatial_integrated, assay = "Spatial", layer = use_layer)
+available_genes <- key_genes[key_genes %in% rownames(mat_for_check)]
+if (length(available_genes) == 0) stop("available_genes is empty.")
+
+effect_sizes <- calculate_cohens_d(
+  Spatial_integrated, available_genes,
+  assay = "Spatial", data_layer = use_layer,
+  group_col = "orig.ident", group1 = "LIVE", group2 = "DEATH",
+  n_bootstrap = 1000, min_boot_valid = 50
+)
+
+p_effect <- ggplot(effect_sizes, aes(x = reorder(gene, cohens_d), y = cohens_d)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), width = 0.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  geom_hline(yintercept = c(-0.2, 0.2), linetype = "dotted", color = "gray") +
+  geom_hline(yintercept = c(-0.5, 0.5), linetype = "dotted", color = "orange") +
+  geom_hline(yintercept = c(-0.8, 0.8), linetype = "dotted", color = "red") +
+  coord_flip() +
+  theme_minimal() +
+  theme(
+    axis.line = element_line(color = "black", linewidth = 0.6),
+    panel.grid = element_blank(),
+    panel.grid.major.x = element_line(color = "grey85"),
+    panel.grid.minor.x = element_blank()
+  ) +
+  labs(title = "Effect Sizes (Cohen's d) with 95% CI",
+       subtitle = "LIVE vs DEATH comparison",
+       x = "Gene", y = "Cohen's d (LIVE - DEATH)")
+print(p_effect)
+ggsave("Fig_S_Effect_Sizes_Spatial_Genes.pdf", p_effect, width = 6, height = 5)
+
+# Spatial expression maps for key genes
+available_genes_plot <- key_genes[key_genes %in% rownames(Spatial_integrated)]
+for (gene in available_genes_plot) {
+  p <- SpatialFeaturePlot(Spatial_integrated, features = gene,
+                          images = names(Spatial_integrated@images), ncol = length(Spatial_integrated@images)) +
+    plot_annotation(title = paste("Spatial Expression Pattern:", gene))
+  ggsave(paste0("Fig_S_Spatial_", gene, "_expression.pdf"), p, width = 12, height = 6)
+}
+
+# =============================================================================
+# 4. ROI analysis and cross-sample reproducibility
+# =============================================================================
+define_rois <- function(spatial_obj, marker_genes, assay = "Spatial", preferred_layers = c("data","counts","scaled")) {
+  DefaultAssay(spatial_obj) <- assay
+  layers_available <- if ("layers" %in% slotNames(spatial_obj[[assay]])) names(spatial_obj[[assay]]@layers) else character(0)
+  test_layer <- function(layer) {
+    m <- try(GetAssayData(spatial_obj, assay = assay, layer = layer), silent = TRUE)
+    if (inherits(m, "try-error") || is.null(m)) return(NULL)
+    m
+  }
+  layer_used <- NA_character_
+  mat <- NULL
+  for (ly in unique(c(preferred_layers, layers_available))) {
+    m <- test_layer(ly)
+    if (!is.null(m) && nrow(m) > 0) { layer_used <- ly; mat <- m; break }
+  }
+  if (is.null(mat)) stop("No usable expression layer found.")
+  roi_scores <- list()
+  for (roi_name in names(marker_genes)) {
+    genes_all <- marker_genes[[roi_name]]
+    genes <- genes_all[genes_all %in% rownames(mat)]
+    if (length(genes) > 0) {
+      expr_matrix <- as.matrix(mat[genes, , drop = FALSE])
+      roi_scores[[roi_name]] <- colMeans(expr_matrix)
+    } else {
+      roi_scores[[roi_name]] <- rep(NA_real_, ncol(mat))
+      names(roi_scores[[roi_name]]) <- colnames(mat)
+    }
+  }
+  attr(roi_scores, "assay") <- assay
+  attr(roi_scores, "layer") <- layer_used
+  roi_scores
+}
+
+roi_markers <- list(
+  "Epithelial_Repair" = c("KRT17", "SFTPC", "AGER"),
+  "Inflammatory" = c("SPP1", "CHI3L1", "MMP9"),
+  "Regenerative" = c("FABP4", "MARCO"),
+  "Fibrotic" = c("CTHRC1", "COL1A1", "FN1")
+)
+roi_scores <- define_rois(Spatial_integrated, roi_markers)
+for (roi in names(roi_scores)) {
+  Spatial_integrated@meta.data[[paste0(roi, "_score")]] <- roi_scores[[roi]]
+}
+
+calculate_cross_sample_correlation <- function(spatial_obj, features) {
+  live_spots <- WhichCells(spatial_obj, expression = orig.ident == "LIVE")
+  death_spots <- WhichCells(spatial_obj, expression = orig.ident == "DEATH")
+  correlations <- list()
+  for (feature in features) {
+    if (feature %in% colnames(spatial_obj@meta.data)) {
+      live_values <- spatial_obj@meta.data[live_spots, feature]
+      death_values <- spatial_obj@meta.data[death_spots, feature]
+      ks_test <- ks.test(live_values, death_values)
+      correlations[[feature]] <- data.frame(
+        feature = feature,
+        live_mean = mean(live_values, na.rm = TRUE),
+        death_mean = mean(death_values, na.rm = TRUE),
+        ks_statistic = ks_test$statistic,
+        ks_pvalue = ks_test$p.value
+      )
+    }
+  }
+  do.call(rbind, correlations)
+}
+
+roi_features <- paste0(names(roi_markers), "_score")
+cross_sample_corr <- calculate_cross_sample_correlation(Spatial_integrated, roi_features)
+message("Cross-sample ROI score comparison:")
+print(cross_sample_corr)
+
+create_summary_figure <- function(spatial_obj, roi_features) {
+  plots <- list()
+  for (i in seq_along(roi_features)) {
+    roi <- roi_features[i]
+    p <- SpatialFeaturePlot(spatial_obj, features = roi, pt.size.factor = 6000,
+                            images = names(spatial_obj@images), ncol = length(spatial_obj@images)) +
+      plot_annotation(title = gsub("_score", "", roi))
+    plots[[i]] <- p
+  }
+  plots
+}
+
+roi_plots <- create_summary_figure(Spatial_integrated, roi_features)
+for (i in seq_along(roi_plots)) {
+  roi_name <- gsub("_score", "", roi_features[i])
+  ggsave(paste0("Fig_S_ROI_", roi_name, "_spatial.pdf"),
+         roi_plots[[i]], width = 12, height = 6)
+}
+
+# =============================================================================
+# 5. Cross-method correlation: RCTD vs NNLS
+# =============================================================================
+get_rctd_weight_matrix <- function(obj, prefix = "rctd_") {
+  md <- obj@meta.data
+  rctd_cols <- grep(paste0("^", prefix), colnames(md), value = TRUE)
+  rctd_cols <- setdiff(rctd_cols, paste0(prefix, c("entropy","max_weight","simpson","label")))
+  if (length(rctd_cols) == 0) stop("No RCTD weight columns in meta.data. Please write rctd_[celltype] columns first.")
+  mat <- as.matrix(md[, rctd_cols, drop = FALSE])
+  rownames(mat) <- rownames(md)
+  colnames(mat) <- sub(paste0("^", prefix), "", colnames(mat))
+  return(mat)
+}
+
+get_nnls_weight_matrix <- function(obj, assay_name = "celltypeprops") {
+  if (!(assay_name %in% names(obj@assays))) stop(sprintf("Assay not found: %s", assay_name))
+  mat <- tryCatch(GetAssayData(obj, assay = assay_name, slot = "data"), error = function(e) NULL)
+  if (is.null(mat) || nrow(mat) == 0 || ncol(mat) == 0) {
+    mat <- tryCatch(GetAssayData(obj, assay = assay_name, slot = "counts"), error = function(e) NULL)
+  }
+  if (is.null(mat) || nrow(mat) == 0 || ncol(mat) == 0) stop("celltypeprops assay data/counts is empty.")
+  mat <- as.matrix(mat)
+  return(mat)
+}
+
+plot_rctd_nnls_correlation <- function(obj,
+                                       rctd_prefix = "rctd_",
+                                       nnls_assay = "celltypeprops",
+                                       cor_method = "pearson",
+                                       top_cells = NULL,
+                                       use_pheatmap = TRUE) {
+  rctd_w <- get_rctd_weight_matrix(obj, prefix = rctd_prefix)   # spots × celltypes (RCTD)
+  nnls_w <- get_nnls_weight_matrix(obj, assay_name = nnls_assay) # celltypes × spots (NNLS)
+  common_spots <- intersect(rownames(rctd_w), colnames(nnls_w))
+  if (length(common_spots) < 10) warning(sprintf("Only %d common spots; correlations may be unstable.", length(common_spots)))
+  rctd_w2 <- rctd_w[common_spots, , drop = FALSE]
+  nnls_w2 <- nnls_w[, common_spots, drop = FALSE]
+  if (!is.null(top_cells) && is.numeric(top_cells) && top_cells > 0) {
+    rctd_var <- apply(rctd_w2, 2, stats::var, na.rm = TRUE)
+    rctd_keep <- names(sort(rctd_var, decreasing = TRUE))[seq_len(min(top_cells, length(rctd_var)))]
+    rctd_w2 <- rctd_w2[, rctd_keep, drop = FALSE]
+    nnls_var <- apply(nnls_w2, 1, stats::var, na.rm = TRUE)
+    nnls_keep <- names(sort(nnls_var, decreasing = TRUE))[seq_len(min(top_cells, length(nnls_var)))]
+    nnls_w2 <- nnls_w2[nnls_keep, , drop = FALSE]
+  }
+  rctd_cts <- colnames(rctd_w2)
+  nnls_cts <- rownames(nnls_w2)
+  cor_mat <- matrix(NA_real_, nrow = length(rctd_cts), ncol = length(nnls_cts),
+                    dimnames = list(rctd_cts, nnls_cts))
+  for (i in seq_along(rctd_cts)) {
+    for (j in seq_along(nnls_cts)) {
+      x <- rctd_w2[, rctd_cts[i]]
+      y <- nnls_w2[nnls_cts[j], ]
+      if (sd(x, na.rm = TRUE) == 0 || sd(y, na.rm = TRUE) == 0) {
+        cor_mat[i, j] <- NA_real_
+      } else {
+        cor_mat[i, j] <- suppressWarnings(stats::cor(x, y, method = cor_method, use = "pairwise.complete.obs"))
+      }
+    }
+  }
+  if (use_pheatmap) {
+    pheatmap::pheatmap(cor_mat,
+                       cluster_rows = TRUE, cluster_cols = TRUE,
+                       color = colorRampPalette(c("#313695","#4575b4","#74add1","#abd9e9","#e0f3f8",
+                                                  "#ffffbf","#fee090","#fdae61","#f46d43","#d73027","#a50026"))(100),
+                       display_numbers = FALSE,
+                       main = "Correlation: RCTD (rows) vs NNLS (cols)",
+                       na_col = "grey90")
+  } else {
+    if (!requireNamespace("circlize", quietly = TRUE)) install.packages("circlize")
+    col_fun <- circlize::colorRamp2(seq(-1, 1, length.out = 11),
+                                    c("#313695","#4575b4","#74add1","#abd9e9","#e0f3f8",
+                                      "#ffffbf","#fee090","#fdae61","#f46d43","#d73027","#a50026"))
+    ComplexHeatmap::Heatmap(cor_mat, name = "cor",
+                            col = col_fun, na_col = "grey90",
+                            cluster_rows = TRUE, cluster_columns = TRUE,
+                            row_title = "RCTD cell types", column_title = "NNLS cell types",
+                            heatmap_legend_param = list(at = seq(-1,1,0.5)))
+  }
+  invisible(cor_mat)
+}
+
+cor_mat <- plot_rctd_nnls_correlation(Spatial_integrated,
+                                      rctd_prefix = "rctd_",
+                                      nnls_assay = "celltypeprops",
+                                      cor_method = "pearson",
+                                      top_cells = NULL,
+                                      use_pheatmap = TRUE)
+write.csv(cor_mat, "RCTD_vs_NNLS_celltype_correlation.csv")
+
+# =============================================================================
+# 6. Module scores: example panels
+# =============================================================================
+AM_resident_genes <- c("PPARG","FABP4","MARCO","LPL")
+MDM_fibrotic_genes <- c("SPP1","CHI3L1","PLA2G7","MMP9","APOE")
+Fib_alveolar_genes <- c("ALDH1A1","PDGFRA","NPNT","COL15A1")
+Fib_adipocyte_like_genes <- c("PLIN2","ADIPOQ","PPARG","FABP4","LPL")
+Fib_CTHRC1_pathologic_genes <- c("CTHRC1","COL1A1","SERPINE1","HIF1A","THBS2","FN1","COL3A1")
+
+DefaultAssay(Spatial_integrated) <- "Spatial"  # Switch to RNA if needed
+Spatial_integrated <- AddModuleScore(Spatial_integrated, features = list(AM_resident_genes), name = "Score_AM_resident")
+colnames(Spatial_integrated@meta.data)[grepl("Score_AM_resident", colnames(Spatial_integrated@meta.data))] <- "Score_AM_resident"
+
+# =============================================================================
+# 7. Save outputs
+# =============================================================================
+write.csv(qc_stats, "Spatial_QC_Statistics.csv", row.names = FALSE)
+write.csv(effect_sizes, "Spatial_Effect_Sizes.csv", row.names = FALSE)
+write.csv(cross_sample_corr, "Cross_Sample_ROI_Correlation.csv", row.names = FALSE)
+write.csv(rctd_df, "RCTD_Deconvolution_Results.csv", row.names = FALSE)
+
+methods_text <- "
+## Supplemental Methods for Spatial Transcriptomics
+
+### Quality Control and Preprocessing
+- Total spots: LIVE {nrow(Spatial_integrated@images$LIVE@coordinates)}, DEATH {nrow(Spatial_integrated@images$DEATH@coordinates)}
+- QC thresholds: retain spots with number of expressed genes > 200 and UMI count > 500
+- Normalization: SCTransform for normalization and batch correction
+
+### RCTD Cell-type Deconvolution
+- Reference: scRNA-seq data with {length(unique(total_sce$refaligned_celltype2))} cell types
+- Method: spacexr RCTD algorithm with doublet mode
+- Uncertainty metrics: entropy, max weight, Simpson index
+
+### Effect Size Analysis
+- Cohen's d for LIVE vs DEATH differences with bootstrap (n=1000) for 95% CI
+- Interpretation: |d| < 0.2 (small), 0.2–0.5 (medium), 0.5–0.8 (large), >0.8 (very large)
+
+### Spatial Pattern Analysis
+- ROI definition: average expression of function-related marker genes
+- Cross-sample consistency: Kolmogorov–Smirnov test of distributions
+"
+writeLines(methods_text, "Spatial_Methods_Supplement.txt")
+
+message("Spatial analysis completed!")
+message("Generated files include:")
+message("- QC plots: Fig_S_Spatial_QC_metrics.pdf")
+message("- Key gene spatial expression: Fig_S_Spatial_[gene]_expression.pdf")
+message("- Cell-type proportion comparison: Fig_S_CellType_Proportions_Comparison.pdf")
+message("- RCTD uncertainty analysis: Fig_S_RCTD_Uncertainty_Spatial.pdf")
+message("- Effect size analysis: Fig_S_Effect_Sizes_Spatial_Genes.pdf")
+message("- ROI spatial distribution: Fig_S_ROI_[roi]_spatial.pdf")
+message("- Tables and supplemental methods text")
+
+# Save R objects
+save(Spatial_integrated, reference, rctd_df, rctd_results, file = "RCTD_deconvolution_objects.Rdata")
