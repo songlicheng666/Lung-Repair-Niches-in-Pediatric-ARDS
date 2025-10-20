@@ -1,0 +1,715 @@
+# Pediatric BALF scRNA-seq: Annotation, Subsetting, Scoring and Analysis
+# This script performs:
+#   - Global rule-based major-type annotation using module scores
+#   - Manual relabeling of clusters to major lineages
+#   - Subsetting into epithelial / myeloid (MON_MAC) / neutrophil compartments
+#   - Reclustering and fine-grained annotation within subsets
+#   - Writing back subset annotations to the combined object
+#   - Proportion summaries, statistical tests, and visualizations by sample/group/severity
+#   - ISG and reference module scoring, and severity trend analyses
+#
+# Notes:
+#   - Ensure combined_seurat is loaded beforehand.
+#   - Some parts depend on meta columns: sample, group, severity, patients (optional).
+#   - Seurat v4+ is assumed.
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(SeuratWrappers)
+  library(batchelor)
+  library(SingleCellExperiment)
+  library(Matrix)
+  library(dplyr)
+  library(stringr)
+  library(ggplot2)
+  library(patchwork)
+  library(pROC)
+  library(tidyr)
+  library(forcats)
+  library(purrr)
+  library(stringr)
+  library(rstatix)
+  library(ggpubr)
+  library(DT)
+  library(FSA)
+})
+
+# =========================
+# 0) Marker lists for module scoring (global)
+# =========================
+markers_lists <- list(
+  Neutrophil = c("FCGR3B","S100A8","S100A9","S100A12","LCN2","PI3","CXCR2","CXCR4","SELL","VNN2","GCA","FOLR3"),
+  Monocyte   = c("CD14","VCAN","S100A8","S100A9","LYZ","RETN"),
+  Macrophage = c("CD68","MARCO","APOC1","MSR1","MERTK","FABP4","SPP1","CXCL10","IL10","AREG","OLR1","THBS1","CD74"),
+  Epithelial = c("EPCAM","KRT5","MUC5AC","SCGB1A1","FOXJ1","PIFO","HES6","FOXN4","KRT13","CXCL17"),
+  DC         = c("FCER1A","ITGAX","CCR7")
+)
+
+# Helper to add module scores and drop the "1" suffix that Seurat appends
+add_module_scores <- function(obj, modules, prefix = "score") {
+  stopifnot(length(names(modules)) == length(modules))
+  for (nm in names(modules)) {
+    genes <- intersect(modules[[nm]], rownames(obj))
+    if (length(genes) == 0) {
+      warning(sprintf("Module %s has no genes present in object; skipped.", nm))
+      next
+    }
+    obj <- Seurat::AddModuleScore(obj, features = list(genes), name = paste0(prefix, "_", nm))
+    old <- paste0(prefix, "_", nm, "1")
+    new <- paste0(prefix, "_", nm)
+    if (old %in% colnames(obj@meta.data)) {
+      colnames(obj@meta.data)[colnames(obj@meta.data) == old] <- new
+    }
+  }
+  obj
+}
+
+combined_seurat <- add_module_scores(combined_seurat, markers_lists, prefix = "score")
+
+# =========================
+# 1) Rule-based major-type assignment (thresholds can be tuned)
+# Priority: Epithelial > Neutrophil > MNP (Macrophage/Monocyte) > DC
+# =========================
+annot_major <- rep("Other", ncol(combined_seurat))
+df <- combined_seurat@meta.data
+
+# Using the normalized column names without numeric suffix
+annot_major[df$score_Epithelial > 0.1] <- "Epithelial"
+annot_major[df$score_Neutrophil > 0.1 & annot_major == "Other"] <- "Neutrophil"
+annot_major[(df$score_Macrophage > 0.1 | df$score_Monocyte > 0.1) & annot_major == "Other"] <- "MNP"
+annot_major[df$score_DC > 0.1 & annot_major == "Other"] <- "DC"
+
+combined_seurat$major_type <- annot_major
+
+# QC plots for key lineage markers
+DimPlot(combined_seurat, group.by = "celltype1", label = TRUE)
+FeaturePlot(combined_seurat, features = "EPCAM")
+FeaturePlot(combined_seurat, features = "CDH1")
+FeaturePlot(combined_seurat, features = c("CD3D","CD3E","CD3G"))
+FeaturePlot(combined_seurat, features = c("CD79A","MZB1","MS4A1","CD38","SDC1"))
+FeaturePlot(combined_seurat, features = c("MARCO","MSR1","MRC1"))
+FeaturePlot(combined_seurat, features = c("FCN1","CD14"))
+FeaturePlot(combined_seurat, features = c("FCGR3B","G0S2"))
+FeaturePlot(combined_seurat, features = c("CD1C"))
+FeaturePlot(combined_seurat, features = c("KLRF1"))
+
+# =========================
+# 2) Manual relabeling of clusters into broad classes (celltype1)
+# =========================
+new.cluster.ids <- c(
+  "0"="MON_MAC","1"="NEU","2"="NEU","3"="NK_T","4"="NEU","5"="B","6"="NK_T","7"="MON_MAC",
+  "8"="NK_T","9"="NK_T","10"="epi","11"="DC","12"="epi","13"="epi","14"="MON_MAC","15"="MON_MAC",
+  "16"="B","17"="epi","18"="MON_MAC","19"="epi"
+)
+present_ids <- as.character(sort(unique(Idents(combined_seurat))))
+map_use <- new.cluster.ids[names(new.cluster.ids) %in% present_ids]
+combined_seurat <- RenameIdents(combined_seurat, map_use)
+combined_seurat$celltype1 <- combined_seurat@active.ident
+
+# =========================
+# 3) Subsetting into epi / MON_MAC / NEU and reclustering
+# =========================
+# Note: If your source object for subsetting was mnn_seurat, ensure consistency.
+epi <- subset(combined_seurat, subset = celltype1 == "epi")
+MON_MAC <- subset(combined_seurat, subset = celltype1 == "MON_MAC")
+NEU <- subset(combined_seurat, subset = celltype1 == "NEU")
+
+# ---- Epithelial subset: reclustering and fine annotation
+if (ncol(epi) > 0) {
+  epi <- NormalizeData(epi)
+  epi <- FindVariableFeatures(epi, selection.method = "vst", nfeatures = 3000)
+  epi <- ScaleData(epi)
+  epi <- RunPCA(epi, features = VariableFeatures(epi))
+  DimHeatmap(epi, dims = 1:15, cells = 500, balanced = TRUE)
+  epi <- FindNeighbors(epi, dims = 1:15)
+  epi <- FindClusters(epi, resolution = 0.8)
+  epi <- RunUMAP(epi, dims = 1:15, do.fast = FALSE, check_duplicates = FALSE)
+  
+  # Marker inspection
+  FeaturePlot(epi, features = c("EPCAM","KRT5","MUC5AC","SCGB1A1","FOXJ1","PIFO","HES6","FOXN4","KRT13","CXCL17"))
+  genes_to_check <- c("KRT5","MUC5AC","SCGB1A1","HES6","RIMS2","SOX5","FOXJ1","CCDC78","KRT17","KRT13","CXCL17")
+  # Use current identities for DotPlot grouping after annotation
+  Idents(epi) <- "seurat_clusters"
+  epi_ids <- c(
+    "0"="Secretory","1"="Deuterosomal","2"="SOX5","3"="Secretory","4"="SOX5","5"="Ciliated",
+    "6"="Hillock_like","7"="Ciliated","8"="Ciliated","9"="FIB","10"="Ciliated","11"="SOX5"
+  )
+  epi_map_use <- epi_ids[names(epi_ids) %in% levels(Idents(epi))]
+  epi <- RenameIdents(epi, epi_map_use)
+  epi$celltype2 <- epi@active.ident
+  
+  DimPlot(epi, reduction = "umap", label = TRUE, group.by = "celltype2", raster = FALSE)
+  p <- DotPlot(epi, features = genes_to_check, group.by = "celltype2") + coord_flip()
+  print(p)
+  
+  # Feature checks
+  FeaturePlot(epi, features = c("KRT5","FOXJ1","SCGB3A2","SCGB1A1","MUC5AC","KRT17","KRT13","RIMS2","PIFO","GDF15","FOXN4","HES6","CXCL17","SOX5"))
+  
+  # Markers (use modern arg logfc.threshold)
+  sce.markers <- FindAllMarkers(object = epi, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+  DT::datatable(sce.markers)
+  write.csv(sce.markers, file = "first_epi.markers.csv", row.names = FALSE)
+  
+  # Save subset
+  save(epi, file = "PublicData_Epithelial.Rdata")
+}
+
+# ---- MON_MAC subset: reclustering and fine annotation
+if (ncol(MON_MAC) > 0) {
+  MON_MAC <- NormalizeData(MON_MAC)
+  MON_MAC <- FindVariableFeatures(MON_MAC, selection.method = "vst", nfeatures = 3000)
+  MON_MAC <- ScaleData(MON_MAC)
+  MON_MAC <- RunPCA(MON_MAC, features = VariableFeatures(MON_MAC))
+  DimHeatmap(MON_MAC, dims = 1:15, cells = 500, balanced = TRUE)
+  MON_MAC <- FindNeighbors(MON_MAC, dims = 1:15)
+  MON_MAC <- FindClusters(MON_MAC, resolution = 0.8)
+  MON_MAC <- RunUMAP(MON_MAC, dims = 1:15, do.fast = TRUE, check_duplicates = FALSE)
+  DimPlot(MON_MAC, reduction = "umap", label = TRUE, group.by = "seurat_clusters", raster = FALSE)
+  
+  genes_to_check <- c("SPP1","IL6","THBS1","FCN1","OLR1","AREG","CXCL10","FABP4","APOE")
+  p <- DotPlot(MON_MAC, features = genes_to_check, group.by = "seurat_clusters") + coord_flip()
+  print(p)
+  
+  sce.markers <- FindAllMarkers(object = MON_MAC, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+  DT::datatable(sce.markers)
+  write.csv(sce.markers, file = "first_MON_MAC.markers.csv", row.names = FALSE)
+  
+  FeaturePlot(MON_MAC, features = c("CD14","FCN1","FABP4","IL10","CXCL10","SPP1","FOLR2","AREG","IL6","GDF15","FOXN4","HES6","CXCL17","SOX5"))
+  
+  Idents(MON_MAC) <- "seurat_clusters"
+  mon_ids <- c(
+    "0"="SPP1_repair_MNP","1"="Inflammatory_MNP","2"="Inflammatory_MNP","3"="Repair_like_MNP",
+    "4"="ISG_high_MNP","5"="ISG_high_MNP","6"="SPP1_repair_MNP","7"="Inflammatory_MNP",
+    "8"="Inflammatory_MNP","9"="SPP1_repair_MNP","10"="Resident_like_MNP","11"="Resident_like_MNP",
+    "12"="SPP1_repair_MNP","13"="Resident_like_MNP"
+  )
+  mon_map_use <- mon_ids[names(mon_ids) %in% levels(Idents(MON_MAC))]
+  MON_MAC <- RenameIdents(MON_MAC, mon_map_use)
+  MON_MAC$celltype2 <- MON_MAC@active.ident
+  save(MON_MAC, file = "PublicData_MON_MAC.Rdata")
+}
+
+# ---- NEU subset: reclustering, maturation states, and markers
+if (ncol(NEU) > 0) {
+  FeaturePlot(NEU, features = c("FCGR3B","CXCR2","CXCR4","S100A8","S100A9","S100A12","LCN2","PI3","SELL","VNN2","GCA","FOLR3"))
+  
+  NEU <- NormalizeData(NEU)
+  NEU <- FindVariableFeatures(NEU, selection.method = "vst", nfeatures = 3000)
+  NEU <- ScaleData(NEU)
+  NEU <- RunPCA(NEU, features = VariableFeatures(NEU))
+  DimHeatmap(NEU, dims = 1:15, cells = 500, balanced = TRUE)  # FIXED from MON_MAC
+  NEU <- FindNeighbors(NEU, dims = 1:15)
+  NEU <- FindClusters(NEU, resolution = 0.8)
+  NEU <- RunUMAP(NEU, dims = 1:15, do.fast = TRUE, check_duplicates = FALSE)
+  DimPlot(NEU, reduction = "umap", label = TRUE, group.by = "seurat_clusters", raster = FALSE)
+  
+  genes_to_check <- c("FCGR3B","CXCR2","CXCR4","S100A8","S100A9","S100A12","LCN2","PI3","SELL","VNN2","GCA","FOLR3")
+  p <- DotPlot(NEU, features = genes_to_check, group.by = "seurat_clusters") + coord_flip()
+  print(p)
+  
+  sce.markers <- FindAllMarkers(object = NEU, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+  DT::datatable(sce.markers)
+  write.csv(sce.markers, file = "first_NEU.markers.csv", row.names = FALSE)
+  
+  FeaturePlot(NEU, features = c("CXCR2","CXCR4","LCN2","S100A8","S100A9","CD14"))
+  FeaturePlot(MON_MAC, features = c("FOLR2","AREG","IL6","GDF15","FOXN4","HES6","CXCL17","SOX5"))
+  
+  # Neutrophil maturation: high CXCR2 = mature, high CXCR4 = aged, otherwise intermediate
+  cxcr2 <- FetchData(NEU, "CXCR2")[,1]
+  cxcr4 <- FetchData(NEU, "CXCR4")[,1]
+  thr2 <- quantile(cxcr2, 0.6, na.rm = TRUE)  # FIXED: quantile on vector
+  thr4 <- quantile(cxcr4, 0.6, na.rm = TRUE)
+  
+  NEU$Neutro_state <- "intermediate"
+  NEU$Neutro_state[cxcr2 >= thr2 & cxcr4 < thr4] <- "mature"
+  NEU$Neutro_state[cxcr4 >= thr4 & cxcr2 < thr2] <- "aged"
+  Idents(NEU) <- "Neutro_state"
+  DimPlot(NEU, group.by = "celltype2", label = TRUE)
+  
+  # Differential gene visualization
+  FeaturePlot(NEU, features = c("IL1RN","IL1B","TNFAIP3","IER3"))
+  FeaturePlot(NEU, features = c("CCL3L1","CCL4L2","IFI30","HES4"))
+  
+  Idents(NEU) <- "seurat_clusters"
+  neu_ids <- c(
+    "0"="Mature","1"="FIB","2"="Mature","3"="Aged","4"="Aged","5"="intermediate",
+    "6"="Aged","7"="FIB","8"="FIB","9"="FIB"
+  )
+  neu_map_use <- neu_ids[names(neu_ids) %in% levels(Idents(NEU))]
+  NEU <- RenameIdents(NEU, neu_map_use)
+  NEU$celltype2 <- NEU@active.ident
+  save(NEU, file = "PublicData_NEU.Rdata")
+}
+
+# =========================
+# 4) ISG and reference module scoring (subsets)
+# =========================
+ISG_genes <- c("ISG15","IFI6","IFIT1","IFIT2","IFIT3","MX1","MX2","IFITM1","IFITM2","IFITM3","OAS1","OAS2","OAS3","RSAD2","IFI44","IFI44L","XAF1","IRF7","STAT1","CXCL10")
+if (ncol(NEU) > 0) {
+  ISG_use <- intersect(ISG_genes, rownames(NEU))
+  NEU <- AddModuleScore(NEU, features = list(ISG_use), name = "ISG")
+  VlnPlot(NEU, features = "ISG1", group.by = "celltype2")
+}
+if (ncol(MON_MAC) > 0) {
+  ISG_use_mac <- intersect(ISG_genes, rownames(MON_MAC))
+  MON_MAC <- AddModuleScore(MON_MAC, features = list(ISG_use_mac), name = "ISG")
+}
+
+# Reference modules for MON_MAC (use a named list to avoid deparse/substitute issues)
+MNP_inflam       <- c("FCN1","S100A8","S100A9","S100A12","VCAN","RETN")
+MNP_spp1_repair  <- c("SPP1","MERTK","TREM2","CTSB","CTSD")
+MNP_isg          <- c("CXCL10","ISG15","IFI6","IFIT1","MX1","STAT1")
+mon_modules <- list(
+  MNP_inflam = intersect(MNP_inflam, rownames(MON_MAC)),
+  MNP_spp1_repair = intersect(MNP_spp1_repair, rownames(MON_MAC)),
+  MNP_isg = intersect(MNP_isg, rownames(MON_MAC))
+)
+if (ncol(MON_MAC) > 0) {
+  for (nm in names(mon_modules)) {
+    MON_MAC <- AddModuleScore(MON_MAC, features = list(mon_modules[[nm]]), name = paste0("MNPmod_", nm))
+    old <- paste0("MNPmod_", nm, "1")
+    new <- paste0("MNPmod_", nm)
+    if (old %in% colnames(MON_MAC@meta.data)) {
+      colnames(MON_MAC@meta.data)[colnames(MON_MAC@meta.data) == old] <- new
+    }
+  }
+}
+
+# =========================
+# 5) Write back subset annotations to combined object and remove FIB
+# =========================
+extract_ann <- function(obj, label_col = "celltype2") {
+  stopifnot(label_col %in% colnames(obj@meta.data))
+  bc <- colnames(obj)
+  lbl <- FetchData(obj, vars = label_col)[, 1]
+  data.frame(barcode = as.character(bc), celltype2_new = as.character(lbl), stringsAsFactors = FALSE)
+}
+anno_NEU <- if (exists("NEU") && ncol(NEU) > 0) extract_ann(NEU, "celltype2") else data.frame()
+anno_epi <- if (exists("epi") && ncol(epi) > 0) extract_ann(epi, "celltype2") else data.frame()
+anno_MON <- if (exists("MON_MAC") && ncol(MON_MAC) > 0) extract_ann(MON_MAC, "celltype2") else data.frame()
+
+anno_all <- rbind(anno_NEU, anno_epi, anno_MON)
+
+combined_bc <- colnames(combined_seurat)
+old_celltype2 <- combined_seurat$celltype2
+new_celltype2 <- as.character(old_celltype2)
+
+apply_update <- function(target_vec, anno_df) {
+  if (nrow(anno_df) == 0) return(target_vec)
+  idx <- match(combined_bc, anno_df$barcode)
+  hit <- !is.na(idx)
+  target_vec[hit] <- anno_df$celltype2_new[idx[hit]]
+  target_vec
+}
+
+new_celltype2 <- apply_update(new_celltype2, anno_NEU)
+new_celltype2 <- apply_update(new_celltype2, anno_epi)
+new_celltype2 <- apply_update(new_celltype2, anno_MON)
+
+combined_seurat$celltype2 <- new_celltype2
+all_levels <- sort(unique(na.omit(c(as.character(old_celltype2),
+                                    if (nrow(anno_NEU)>0) anno_NEU$celltype2_new,
+                                    if (nrow(anno_epi)>0) anno_epi$celltype2_new,
+                                    if (nrow(anno_MON)>0) anno_MON$celltype2_new))))
+combined_seurat$celltype2 <- factor(combined_seurat$celltype2, levels = all_levels)
+
+# Remove FIB cells if present
+keep_cells <- colnames(combined_seurat)[combined_seurat$celltype2 != "FIB"]
+combined_seurat <- subset(combined_seurat, cells = keep_cells)
+
+table(combined_seurat$celltype2, useNA = "ifany")
+DimPlot(combined_seurat, group.by = "celltype2")
+
+# Standardize subtype naming with parent prefix for epi/NEU/MON_MAC
+ct1 <- as.character(combined_seurat$celltype1)
+ct2 <- as.character(combined_seurat$celltype2)
+ct2 <- gsub("^Inflammatory_MNP$", "Inflammatory", ct2)
+ct2 <- gsub("^ISG_high_MNP$",    "ISG_high", ct2)
+ct2 <- gsub("^Repair_like_MNP$", "Repair_like", ct2)
+ct2 <- gsub("^Resident_like_MNP$", "Resident_like", ct2)
+ct2 <- gsub("^SPP1_repair_MNP$", "SPP1_repair", ct2)
+mask <- ct1 %in% c("epi", "NEU", "MON_MAC")
+ct2[mask] <- paste0(ct1[mask], "_", ct2[mask])
+combined_seurat$celltype2 <- factor(ct2)
+
+table(combined_seurat$celltype1, combined_seurat$celltype2)
+save(combined_seurat, file = "Final_public_seurat_with_subtypes.Rdata")
+
+# =========================
+# 6) Epithelial-only: sample-level subtype proportions and statistics
+# =========================
+if (exists("epi") && ncol(epi) > 0) {
+  epi <- epi[, epi@meta.data$celltype2 %in% c("Secretory","Deuterosomal","SOX5","Ciliated","Hillock_like")]
+  stopifnot(all(c("sample","group","severity","celltype2") %in% colnames(epi@meta.data)))
+  
+  epi@meta.data$group    <- factor(epi@meta.data$group, levels = c("Control","ARDS Acute","ARDS Recovery"))
+  epi@meta.data$severity <- factor(epi@meta.data$severity, levels = c("Control","No PARDS","Mild","Moderate","Severe"))
+  
+  meta_cols <- c("sample", "group", "severity", "celltype2")
+  stopifnot(all(meta_cols %in% colnames(combined_seurat@meta.data)))
+  
+  meta <- epi@meta.data %>% dplyr::select(all_of(meta_cols))
+  meta$group     <- factor(meta$group, levels = c("Control","ARDS Acute","ARDS Recovery"))
+  meta$severity  <- factor(meta$severity, levels = c("Control","No PARDS","Mild","Moderate","Severe"))
+  meta$celltype2 <- as.character(meta$celltype2)
+  meta$sample    <- as.character(meta$sample)
+  
+  # Example calculation: proportions per sample and summaries by group/severity
+  sample_celltype_counts <- dplyr::count(meta, sample, celltype2, name = "n_cells")
+  sample_totals <- dplyr::count(meta, sample, name = "n_total")
+  all_celltypes <- sort(unique(meta$celltype2))
+  
+  sample_props <- sample_celltype_counts %>%
+    group_by(sample) %>%
+    tidyr::complete(celltype2 = all_celltypes, fill = list(n_cells = 0)) %>%
+    ungroup() %>%
+    left_join(sample_totals, by = "sample") %>%
+    mutate(prop = ifelse(n_total > 0, n_cells / n_total, NA_real_)) %>%
+    left_join(meta %>% distinct(sample, group, severity), by = "sample")
+  
+  stopifnot(!any(is.na(sample_props$n_total)))
+  stopifnot(all(sample_props$prop >= 0 & sample_props$prop <= 1, na.rm = TRUE))
+  
+  summary_by_group <- sample_props %>%
+    group_by(group, celltype2) %>%
+    summarise(
+      mean_prop = mean(prop, na.rm = TRUE),
+      sd_prop = sd(prop, na.rm = TRUE),
+      n = sum(!is.na(prop)),
+      se = sd_prop / sqrt(pmax(n, 1)),
+      ci95 = 1.96 * se,
+      .groups = "drop"
+    )
+  
+  summary_by_severity <- sample_props %>%
+    group_by(severity, celltype2) %>%
+    summarise(
+      mean_prop = mean(prop, na.rm = TRUE),
+      sd_prop = sd(prop, na.rm = TRUE),
+      n = sum(!is.na(prop)),
+      se = sd_prop / sqrt(pmax(n, 1)),
+      ci95 = 1.96 * se,
+      .groups = "drop"
+    )
+  
+  # Statistical tests
+  test_by_group <- sample_props %>%
+    group_by(celltype2) %>%
+    do({
+      df <- .
+      k <- n_distinct(df$group)
+      if (k == 2) {
+        res <- wilcox_test(df, prop ~ group, detailed = TRUE) %>%
+          add_significance("p") %>% mutate(test = "Wilcoxon")
+      } else {
+        kw <- kruskal_test(df, prop ~ group) %>% mutate(test = "Kruskal-Wallis")
+        dunn <- dunn_test(df, prop ~ group, p.adjust.method = "BH")
+        res <- bind_rows(kw %>% mutate(.y. = "prop", group1 = NA_character_, group2 = NA_character_), dunn)
+      }
+      res
+    }) %>% ungroup()
+  
+  test_by_severity <- sample_props %>%
+    group_by(celltype2) %>%
+    do({
+      df <- .
+      k <- n_distinct(df$severity)
+      if (k == 2) {
+        res <- wilcox_test(df, prop ~ severity, detailed = TRUE) %>%
+          add_significance("p") %>% mutate(test = "Wilcoxon")
+      } else {
+        kw <- kruskal_test(df, prop ~ severity) %>% mutate(test = "Kruskal-Wallis")
+        dunn <- dunn_test(df, prop ~ severity, p.adjust.method = "BH")
+        res <- bind_rows(kw %>% mutate(.y. = "prop", group1 = NA_character_, group2 = NA_character_), dunn)
+      }
+      res
+    }) %>% ungroup()
+  
+  # Plots
+  p_sample <- sample_props %>%
+    mutate(celltype2 = fct_relevel(celltype2, all_celltypes)) %>%
+    ggplot(aes(x = sample, y = prop, fill = celltype2)) +
+    geom_col(width = 0.9, color = "gray20", linewidth = 0.1) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+    labs(x = "Sample", y = "Proportion", fill = "Cell type") +
+    theme_bw(base_size = 12) +
+    theme(axis.text.x = element_text(angle = 60, hjust = 1, vjust = 1),
+          panel.grid.major.x = element_blank())
+  
+  group_stack <- summary_by_group %>%
+    mutate(celltype2 = fct_relevel(celltype2, all_celltypes))
+  p_group <- ggplot(group_stack, aes(x = group, y = mean_prop, fill = celltype2)) +
+    geom_col(width = 0.9, color = "gray20", linewidth = 0.1) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+    labs(x = "Group", y = "Mean proportion (by sample)", fill = "Cell type") +
+    theme_bw(base_size = 12) +
+    theme(panel.grid.major.x = element_blank())
+  
+  p_group_facets <- sample_props %>%
+    ggplot(aes(x = group, y = prop, fill = group)) +
+    geom_boxplot(alpha = 0.4, outlier.shape = NA) +
+    geom_jitter(width = 0.15, size = 0.8, alpha = 0.6) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+    labs(x = "Group", y = "Proportion (by sample)") +
+    facet_wrap(~ celltype2, scales = "free_y") +
+    theme_bw(base_size = 12) +
+    theme(panel.grid.major.x = element_blank(), legend.position = "none")
+  
+  severity_stack <- summary_by_severity %>%
+    mutate(celltype2 = fct_relevel(celltype2, all_celltypes))
+  p_severity <- ggplot(severity_stack, aes(x = severity, y = mean_prop, fill = celltype2)) +
+    geom_col(width = 0.9, color = "gray20", linewidth = 0.1) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+    labs(x = "Severity", y = "Mean proportion (by sample)", fill = "Cell type") +
+    theme_bw(base_size = 12) +
+    theme(panel.grid.major.x = element_blank())
+  
+  print(p_sample); print(p_group); print(p_group_facets); print(p_severity)
+  
+  write.csv(sample_props, "sample_celltype2_proportions.csv", row.names = FALSE)
+  write.csv(summary_by_group, "group_level_proportions.csv", row.names = FALSE)
+  write.csv(summary_by_severity, "severity_level_proportions.csv", row.names = FALSE)
+  write.csv(test_by_group, "stats_by_group.csv", row.names = FALSE)
+  write.csv(test_by_severity, "stats_by_severity.csv", row.names = FALSE)
+  
+  # Epithelial KRT17 violin plots by severity/group
+  epi$group <- factor(epi$group)
+  epi$celltype2 <- factor(epi$celltype2)
+  epi$severity <- factor(epi$severity)
+  p <- VlnPlot(object = epi, features = "KRT17", group.by = "celltype2", split.by = "severity", pt.size = 0, assay = DefaultAssay(epi))
+  print(p)
+  p2 <- VlnPlot(object = epi, features = "KRT17", group.by = "celltype2", split.by = "group", pt.size = 0, assay = DefaultAssay(epi))
+  print(p2)
+  save(epi, file = "PublicData_Epithelial.Rdata")
+}
+
+# =========================
+# 7) Optional: alternative proportion summaries for NEU and MON_MAC
+# =========================
+if (exists("NEU") && ncol(NEU) > 0) {
+  neu_prop_by_sample <- NEU@meta.data %>%
+    count(sample, group, celltype2, severity, name = "n_cells") %>%
+    group_by(sample) %>%
+    mutate(sample_total = sum(n_cells), prop = n_cells / sample_total) %>%
+    ungroup()
+  neu_prop_by_group <- neu_prop_by_sample %>%
+    group_by(group, celltype2) %>%
+    summarise(mean_prop = mean(prop), sd_prop = sd(prop),
+              se_prop = sd(prop)/sqrt(n()), n_samples = n_distinct(sample), .groups = "drop")
+  neu_prop_by_group_wide <- neu_prop_by_group %>%
+    select(group, celltype2, mean_prop) %>%
+    pivot_wider(names_from = celltype2, values_from = mean_prop, values_fill = 0)
+  
+  # Example stats for NEU Aged subgroup
+  neu_aged_sample <- neu_prop_by_sample %>% filter(celltype2 == "Aged")
+  print(kruskal.test(prop ~ group, data = neu_aged_sample))
+  pairwise_stats_neu <- neu_prop_by_sample %>% group_by(celltype2) %>% dunn_test(prop ~ group, p.adjust.method = "BH")
+  print(pairwise_stats_neu)
+  
+  # Example plots
+  ggplot(neu_prop_by_sample, aes(x = group, y = prop, fill = group)) +
+    geom_boxplot(width = 0.7, outlier.shape = NA) +
+    geom_jitter(width = 0.1, size = 1, alpha = 0.5) +
+    facet_wrap(~ celltype2, scales = "free_y") +
+    theme_bw() +
+    labs(title = "NEU subtype proportions by group (per sample)", y = "Proportion", x = "Group")
+  
+  ggplot(neu_prop_by_sample, aes(x = severity, y = prop, fill = severity)) +
+    geom_boxplot(width = 0.7, outlier.shape = NA) +
+    facet_wrap(~ celltype2, scales = "free_y") +
+    theme_bw() +
+    labs(title = "NEU subtype proportions by severity (per sample)", y = "Proportion", x = "Severity")
+}
+
+if (exists("MON_MAC") && ncol(MON_MAC) > 0) {
+  mac_prop_by_sample <- MON_MAC@meta.data %>%
+    count(sample, group, celltype2, severity, name = "n_cells") %>%
+    group_by(sample) %>%
+    mutate(sample_total = sum(n_cells), prop = n_cells / sample_total) %>%
+    ungroup()
+  mac_prop_by_group <- mac_prop_by_sample %>%
+    group_by(group, celltype2) %>%
+    summarise(mean_prop = mean(prop), sd_prop = sd(prop),
+              se_prop = sd(prop)/sqrt(n()), n_samples = n_distinct(sample), .groups = "drop")
+  mac_prop_by_group_wide <- mac_prop_by_group %>%
+    select(group, celltype2, mean_prop) %>%
+    pivot_wider(names_from = celltype2, values_from = mean_prop, values_fill = 0)
+  
+  pairwise_stats_mac <- mac_prop_by_sample %>% group_by(celltype2) %>% dunn_test(prop ~ group, p.adjust.method = "BH")
+  print(pairwise_stats_mac)
+  
+  ggplot(mac_prop_by_sample, aes(x = group, y = prop, fill = group)) +
+    geom_boxplot(width = 0.7, outlier.shape = NA) +
+    geom_jitter(width = 0.1, size = 1, alpha = 0.5) +
+    facet_wrap(~ celltype2, scales = "free_y") +
+    theme_bw() +
+    labs(title = "MON_MAC subtype proportions by group (per sample)", y = "Proportion", x = "Group")
+  
+  ggplot(mac_prop_by_sample, aes(x = severity, y = prop, fill = severity)) +
+    geom_boxplot(width = 0.7, outlier.shape = NA) +
+    facet_wrap(~ celltype2, scales = "free_y") +
+    theme_bw() +
+    labs(title = "MON_MAC subtype proportions by severity (per sample)", y = "Proportion", x = "Severity")
+}
+
+# =========================
+# 8) KRT17/PATS module scoring in epithelial subset and severity trends
+# =========================
+if (exists("epi") && ncol(epi) > 0) {
+  # Keep epithelial subtypes of interest
+  epi <- epi[, epi@meta.data$celltype2 %in% c("Secretory","Deuterosomal","SOX5","Ciliated","Hillock_like")]
+  
+  # Required meta
+  required_meta <- c("sample","group","severity","celltype2")
+  required_meta <- intersect(required_meta, colnames(epi@meta.data))
+  stopifnot(all(c("sample","group","severity","celltype2") %in% colnames(epi@meta.data)))
+  
+  # Factor order
+  epi$group    <- factor(epi$group, levels = c("Control","ARDS Acute","ARDS Recovery"))
+  epi$severity <- factor(epi$severity, levels = c("Control","No PARDS","Mild","Moderate","Severe"))
+  
+  # Define modules (you can refine based on your references)
+  genes_KRT17_PATS <- c("KRT17","KRT8","CDKN1A","CLDN4")
+  present <- function(g) intersect(g, rownames(epi))
+  list_modules <- list(KRT17_PATS2 = present(genes_KRT17_PATS))
+  
+  # Scoring with stable names
+  score_modules <- function(obj, module_list, prefix = "Score"){
+    for(nm in names(module_list)){
+      if(length(module_list[[nm]]) == 0) next
+      sc <- Seurat::AddModuleScore(object = obj, features = list(module_list[[nm]]),
+                                   name = paste0(prefix, "", nm), assay = DefaultAssay(obj))
+      obj <- sc
+      old <- paste0(prefix, "", nm, "1")
+      new <- paste0(prefix, "_", nm)
+      if(old %in% colnames(obj@meta.data)){
+        colnames(obj@meta.data)[colnames(obj@meta.data)==old] <- new
+      }
+    }
+    obj
+  }
+  
+  epi <- score_modules(epi, list_modules, prefix = "Score")
+  
+  # Optionally, make a SCORE assay for plotting
+  make_score_assay <- function(obj, score_cols, assay_name = "SCORE"){
+    mat <- t(as.matrix(obj@meta.data[, score_cols, drop = FALSE]))
+    assay <- SeuratObject::CreateAssayObject(data = mat)
+    obj[[assay_name]] <- assay
+    obj
+  }
+  score_cols <- intersect(c("Score_KRT17_PATS2"), colnames(epi@meta.data))
+  if(length(score_cols) > 0){
+    epi <- make_score_assay(epi, score_cols, assay_name = "SCORE")
+  }
+  
+  # Sample-level averages and severity trend
+  meta_sc <- epi@meta.data %>%
+    dplyr::select(sample, group, severity, celltype2, all_of(score_cols))
+  cells_per_sample <- meta_sc %>% count(sample, name = "n_cells_sample")
+  sample_scores <- meta_sc %>%
+    group_by(sample, group, severity) %>%
+    summarise(across(all_of(score_cols), ~ mean(.x, na.rm = TRUE)), .groups = "drop") %>%
+    left_join(cells_per_sample, by = "sample")
+  
+  sev_levels <- c("Control","No PARDS","Mild","Moderate","Severe")
+  sample_scores$severity <- factor(sample_scores$severity, levels = sev_levels, ordered = TRUE)
+  sev_num <- as.numeric(sample_scores$severity)
+  
+  trend_res <- map_dfr(score_cols, function(sc){
+    df <- sample_scores %>% filter(!is.na(.data[[sc]]), !is.na(sev_num))
+    if(nrow(df) < 5) return(tibble(feature = sc, rho = NA_real_, p = NA_real_, n = nrow(df)))
+    cor_test <- suppressWarnings(cor.test(df[[sc]], sev_num, method = "spearman", exact = FALSE))
+    tibble(feature = sc, rho = unname(cor_test$estimate), p = cor_test$p.value, n = nrow(df))
+  }) %>% mutate(p.adj = p.adjust(p, method = "BH"))
+  
+  # Kruskal-Wallis + Dunn
+  test_by_severity <- map_dfr(score_cols, function(sc){
+    df <- sample_scores %>% dplyr::select(severity, !!sym(sc)) %>% rename(score = !!sym(sc)) %>% filter(!is.na(score))
+    if(n_distinct(df$severity) < 2) return(tibble(feature = sc, test = NA, p = NA))
+    kw <- kruskal_test(df, score ~ severity) %>% mutate(feature = sc, test = "Kruskal-Wallis")
+    dunn <- dunn_test(df, score ~ severity, p.adjust.method = "BH") %>% mutate(feature = sc, test = "Dunn")
+    bind_rows(kw, dunn)
+  })
+  
+  # Plots: box and trend
+  plot_severity_box <- function(df, feature, ylab = feature){
+    ggplot(df, aes(x = severity, y = .data[[feature]], fill = severity)) +
+      geom_boxplot(alpha = 0.5, outlier.shape = NA) +
+      theme_bw(base_size = 12) +
+      labs(x = "Severity", y = ylab, title = paste0(feature, " by severity")) +
+      theme(legend.position = "none")
+  }
+  p_krt17pats <- plot_severity_box(sample_scores, "Score_KRT17_PATS2", ylab = "KRT17/PATS module score")
+  print(p_krt17pats)
+  ggsave("KRT17_PATS_by_severity_box.pdf", p_krt17pats, width = 4.5, height = 3.5)
+  
+  plot_trend <- function(df, feature){
+    df2 <- df %>% mutate(sev_num = as.numeric(severity))
+    ggplot(df2, aes(x = sev_num, y = .data[[feature]])) +
+      geom_point(aes(color = severity), size = 2, alpha = 0.8) +
+      geom_smooth(method = "lm", se = TRUE, color = "black") +
+      scale_x_continuous(breaks = 1:length(sev_levels), labels = sev_levels) +
+      theme_bw(base_size = 12) +
+      labs(x = "Severity (ordered)", y = feature, title = paste0(feature, " ~ severity"))
+  }
+  p_krt17pats_trend <- plot_trend(sample_scores, "Score_KRT17_PATS2")
+  print(p_krt17pats_trend)
+  ggsave("KRT17_PATS_trend_by_severity.pdf", p_krt17pats_trend, width = 4.5, height = 3.5)
+  
+  # Single-cell facet violin (optional)
+  feature <- "Score_KRT17_PATS2"
+  if (feature %in% colnames(epi@meta.data)) {
+    p_violin <- ggplot(epi@meta.data, aes(x = severity, y = .data[[feature]], fill = severity)) +
+      geom_violin(scale = "width", trim = TRUE) +
+      geom_boxplot(width = 0.1, outlier.shape = NA, alpha = 0.6) +
+      facet_wrap(~ celltype2, ncol = 3, scales = "free_y") +
+      theme_bw(base_size = 11) +
+      theme(legend.position = "none") +
+      labs(x = "Severity", y = "KRT17/PATS score", title = "KRT17/PATS by severity across epithelial subtypes")
+    print(p_violin)
+    ggsave("KRT17_PATS_violin_by_severity_facets.pdf", p_violin, width = 10, height = 8)
+  }
+  
+  # No-control version
+  if (feature %in% colnames(epi@meta.data)) {
+    df_plot <- epi@meta.data %>%
+      dplyr::filter(severity != "Control") %>%
+      dplyr::mutate(severity = factor(severity, levels = c("No PARDS","Mild","Moderate","Severe"), ordered = TRUE))
+    p_violin_nc <- ggplot(df_plot, aes(x = severity, y = .data[[feature]], fill = severity)) +
+      geom_violin(scale = "width", trim = TRUE) +
+      geom_boxplot(width = 0.1, outlier.shape = NA, alpha = 0.6) +
+      facet_wrap(~ celltype2, ncol = 3, scales = "free_y") +
+      theme_bw(base_size = 11) +
+      theme(legend.position = "none") +
+      labs(x = "Severity", y = "KRT17/PATS score", title = "KRT17/PATS by severity across epithelial subtypes (no Control)")
+    print(p_violin_nc)
+    ggsave("KRT17_PATS_violin_by_severity_facets_noControl.pdf", p_violin_nc, width = 10, height = 8)
+  }
+}
+
+# =========================
+# 9) Base R examples (optional)
+# =========================
+if (exists("NEU") && ncol(NEU) > 0) {
+  neu_tab <- with(NEU@meta.data, table(sample, celltype2))
+  neu_prop <- prop.table(neu_tab, margin = 1)
+  neu_sample_group <- unique(NEU@meta.data[, c("sample", "group")])
+  rownames(neu_sample_group) <- neu_sample_group$sample
+  neu_prop_by_group_base <- do.call(rbind, lapply(
+    split(rownames(neu_prop), neu_sample_group[rownames(neu_prop), "group"]),
+    function(smp) colMeans(neu_prop[smp, , drop = FALSE], na.rm = TRUE)
+  ))
+  print(neu_prop_by_group_base)
+}
+if (exists("MON_MAC") && ncol(MON_MAC) > 0) {
+  mac_tab <- with(MON_MAC@meta.data, table(sample, celltype2))
+  mac_prop <- prop.table(mac_tab, margin = 1)
+  mac_sample_group <- unique(MON_MAC@meta.data[, c("sample", "group")])
+  rownames(mac_sample_group) <- mac_sample_group$sample
+  mac_prop_by_group_base <- do.call(rbind, lapply(
+    split(rownames(mac_prop), mac_sample_group[rownames(mac_prop), "group"]),
+    function(smp) colMeans(mac_prop[smp, , drop = FALSE], na.rm = TRUE)
+  ))
+  print(mac_prop_by_group_base)
+}
