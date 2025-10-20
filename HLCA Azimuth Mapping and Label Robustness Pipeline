@@ -1,0 +1,583 @@
+# HLCA Azimuth Mapping and Label Robustness Pipeline
+# Steps:
+#  1) Load reference and query; gene name conversion; QC
+#  2) SCTransform using reference SCT model; find anchors; transfer labels
+#  3) Integrate embeddings; project to reference UMAP; mapping score
+#  4) Visualizations for predicted labels and mapping scores
+#  5) HLCA label selection, uncertainty and entropy
+#  6) Key subgroup flags (SPP1+ MDM, CTHRC1+ FIB, KRT17/PATS epithelial, FABP4 macrophages)
+#  7) Sample-level summaries, group-wise comparisons, and plots
+#  8) Module scores (SPP1_MDM, CTHRC1_FIB, Alveolar_Fib, FABP4_AM, KRT17/PATS) and UMAP/DotPlot
+#  9) Marker heatmap by HLCA labels; proportions and uncertainty summaries
+# 10) Subset-focused scoring/stats for macrophages and fibroblasts
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(Azimuth)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(ggpubr)
+  library(pheatmap)
+  library(SeuratObject)
+  library(forcats)
+  library(readr)
+  library(DT)
+  library(scales)
+})
+
+# =========================
+# Paths (change to your local paths)
+# =========================
+ref_path <- "/home/lungtissue/Child_SpatialTx/HLCA/azimuth/reference-data/human_lung_v2/"
+homolog_path <- "/home/lungtissue/Child_SpatialTx/HLCA/azimuth/homologs.rds"
+query_h5ad <- "/home/lungtissue/Child_SpatialTx/HLCA/sce_total_v4.h5ad"
+
+# =========================
+# Load reference and query
+# =========================
+reference <- LoadReference(path = ref_path)
+query <- LoadFileInput(path = query_h5ad)
+
+# Convert gene names to match reference
+query <- ConvertGeneNames(
+  object = query,
+  reference.names = rownames(reference$map),
+  homolog.table = homolog_path
+)
+
+# nCount_RNA/nFeature_RNA if absent
+if (!all(c("nCount_RNA", "nFeature_RNA") %in% colnames(query[]))) {
+  calcn <- as.data.frame(Seurat:::CalcN(object = query))
+  colnames(calcn) <- paste(colnames(calcn), "RNA", sep = "_")
+  query <- AddMetaData(query, metadata = calcn)
+  rm(calcn)
+}
+
+# percent.mt if genes match "^MT-"
+if (any(grepl("^MT-", rownames(query)))) {
+  query <- PercentageFeatureSet(query, pattern = "^MT-", col.name = "percent.mt", assay = "RNA")
+}
+
+# =========================
+# QC filters (adjust thresholds as needed)
+# =========================
+cells.use <- query[["nCount_RNA", drop = TRUE]] <= 29999 &
+  query[["nCount_RNA", drop = TRUE]] >= 223 &
+  query[["nFeature_RNA", drop = TRUE]] <= 5985 &
+  query[["nFeature_RNA", drop = TRUE]] >= 201
+if ("percent.mt" %in% colnames(query[])) {
+  cells.use <- cells.use & (query[["percent.mt", drop = TRUE]] <= 96 &
+    query[["percent.mt", drop = TRUE]] >= 0)
+}
+query <- query[, cells.use]
+
+# =========================
+# SCTransform with reference model
+# =========================
+query <- SCTransform(
+  object = query,
+  assay = "RNA",
+  new.assay.name = "refAssay",
+  residual.features = rownames(reference$map),
+  reference.SCT.model = reference$map[["refAssay"]]@SCTModel.list$refmodel,
+  method = "glmGamPoi",
+  ncells = 2000,
+  n_genes = 2000,
+  do.correct.umi = FALSE,
+  do.scale = FALSE,
+  do.center = TRUE
+)
+DefaultAssay(query) <- "refAssay"
+DefaultAssay(reference$map) <- "refAssay"
+
+# Some Azimuth references keep SCT in "refAssay"
+reference$map[["SCT"]] <- reference$map[["refAssay"]]
+
+# =========================
+# Find anchors and transfer labels
+# =========================
+anchors <- FindTransferAnchors(
+  reference = reference$map,
+  query = query,
+  k.filter = NA,
+  reference.neighbors = "refdr.annoy.neighbors",
+  reference.assay = "SCT",
+  query.assay = "refAssay",
+  reference.reduction = "refDR",
+  normalization.method = "SCT",
+  features = intersect(rownames(reference$map), VariableFeatures(query)),
+  dims = 1:50,
+  n.trees = 20,
+  mapping.score.k = 100
+)
+
+refdata <- lapply(c("ann_level_3", "ann_finest_level"), function(x) reference$map[[x, drop = TRUE]])
+names(refdata) <- c("ann_level_3", "ann_finest_level")
+
+query <- TransferData(
+  reference = reference$map,
+  query = query,
+  dims = 1:50,
+  anchorset = anchors,
+  refdata = refdata,
+  n.trees = 20,
+  store.weights = TRUE
+)
+
+# =========================
+# Integrate embeddings and compute neighbors on reference space
+# =========================
+query <- IntegrateEmbeddings(
+  anchorset = anchors,
+  reference = reference$map,
+  query = query,
+  reductions = "pcaproject",
+  reuse.weights.matrix = TRUE
+)
+query[["query_ref.nn"]] <- FindNeighbors(
+  object = Embeddings(reference$map[["refDR"]]),
+  query = Embeddings(query[["integrated_dr"]]),
+  return.neighbor = TRUE,
+  l2.norm = TRUE
+)
+
+# Downsampling correction helper to impute refDR embeddings into query
+NNTransform <- function(object, reference, query.neighbors = "query_ref.nn", reduction = "refDR"){
+  nn <- object[[query.neighbors]]
+  get_idx_dist <- function(nn) {
+    if (is.list(nn)) {
+      cand_idx <- c("nn.index","nn_idx","nn.idx","index","idx")
+      cand_dist <- c("nn.dist","nn_dist","dist","distance","dists")
+      idx_name <- intersect(cand_idx, names(nn))
+      dist_name <- intersect(cand_dist, names(nn))
+      if (length(idx_name) >= 1 && length(dist_name) >= 1) {
+        return(list(idx = nn[[idx_name[1]]], dist = nn[[dist_name[1]]]))
+      }
+    }
+    if (isS4(nn)) {
+      slots <- slotNames(nn)
+      if (all(c("nn.idx","nn.dist") %in% slots)) return(list(idx = nn@nn.idx, dist = nn@nn.dist))
+      if (all(c("nn.index","nn.dist") %in% slots)) return(list(idx = nn@nn.index, dist = nn@nn.dist))
+      if (all(c("idx","dist") %in% slots)) return(list(idx = nn@idx, dist = nn@dist))
+    }
+    stop("Unexpected neighbor structure; cannot extract indices/distances.")
+  }
+  nn_par <- get_idx_dist(nn)
+  idx <- nn_par$idx
+  dist <- nn_par$dist
+  if (!inherits(reference, "Seurat")) stop("reference must be a Seurat object")
+  if (!reduction %in% Reductions(reference)) stop(sprintf("Reduction '%s' not found in reference", reduction))
+  ref.emb <- Embeddings(reference[[reduction]])
+  qry.emb <- Embeddings(object[["integrated_dr"]])
+  dist <- t(apply(dist, 1, function(x) if (max(x) > 0) x / max(x) else x))
+  w <- 1 - dist
+  w <- w / rowSums(w)
+  imputed <- matrix(0, nrow = nrow(qry.emb), ncol = ncol(ref.emb))
+  for (i in seq_len(nrow(idx))) {
+    imputed[i, ] <- drop(w[i, ] %*% ref.emb[idx[i, ], , drop=FALSE])
+  }
+  rownames(imputed) <- rownames(qry.emb)
+  colnames(imputed) <- colnames(ref.emb)
+  object[[reduction]] <- CreateDimReducObject(
+    embeddings = imputed, key = paste0(reduction, "_"), assay = DefaultAssay(object)
+  )
+  object
+}
+
+query <- NNTransform(object = query, reference = reference$map, reduction = "refDR")
+query[["proj.umap"]] <- RunUMAP(
+  object = query[["query_ref.nn"]],
+  reduction.model = reference$map[["refUMAP"]],
+  reduction.key = "UMAP_"
+)
+
+# Mapping score
+query <- AddMetaData(object = query, metadata = MappingScore(anchors = anchors), col.name = "mapping.score")
+save(query, file = "azimuth_mapped_query_seurat.Rdata")
+
+# =========================
+# Visualizations: reference and query
+# =========================
+id_choices <- c("ann_level_3", "ann_finest_level")
+id <- id_choices[1]
+predicted.id <- paste0("predicted.", id)
+
+DimPlot(object = reference$plot, reduction = "refUMAP", group.by = id, label = FALSE)
+DimPlot(object = query, reduction = "proj.umap", group.by = predicted.id, label = FALSE)
+FeaturePlot(object = query, features = paste0(predicted.id, ".score"), reduction = "proj.umap")
+VlnPlot(object = query, features = paste0(predicted.id, ".score"), group.by = predicted.id) + NoLegend()
+
+FeaturePlot(query, features = "mapping.score", reduction = "proj.umap", cols = c("white", "red"))
+VlnPlot(object = query, features = "mapping.score", group.by = predicted.id) + NoLegend()
+
+# =========================
+# HLCA label choice, uncertainty and entropy
+# =========================
+id_use <- "ann_finest_level"  # or "ann_level_3"
+predicted_id_col <- paste0("predicted.", id_use)
+if (!predicted_id_col %in% colnames(query@meta.data)) {
+  stop(sprintf("Predicted label column %s missing. Check TransferData refdata/id.", predicted_id_col))
+}
+query$hlca_label <- query@meta.data[[predicted_id_col]]
+
+# Extract prediction score matrix (assay 'prediction.score.<id>' or fallback to meta.data columns)
+get_prediction_score_matrix <- function(sobj, id) {
+  message(paste0("Checking object class: ", class(sobj)[1]))
+  assay_name <- paste0("prediction.score.", id)
+  assay_data_result <- tryCatch({
+    GetAssayData(sobj, assay = assay_name, slot = "data")
+  }, error = function(e) NULL)
+  if (!is.null(assay_data_result)) {
+    message(paste0("Found prediction scores in assay: ", assay_name))
+    return(t(as.matrix(assay_data_result)))
+  }
+  local_predicted_id_col <- paste0("predicted.", id)
+  score_cols_pattern <- paste0("^", local_predicted_id_col, "\\.score\\.")
+  score_cols <- grep(score_cols_pattern, colnames(sobj@meta.data), value = TRUE)
+  if (length(score_cols) > 0) {
+    message(paste0("Found prediction scores in meta.data with pattern: ", score_cols_pattern))
+    mat <- as.matrix(sobj@meta.data[, score_cols, drop = FALSE])
+    colnames(mat) <- sub(score_cols_pattern, "", colnames(mat))
+    return(mat)
+  } else {
+    stop(paste0("Prediction scores for ID '", id, "' not found in assay or meta.data."))
+  }
+}
+
+stopifnot(inherits(query, "Seurat"))
+score_mat <- get_prediction_score_matrix(query, id_use)
+
+# Uncertainty and entropy
+maxp <- apply(score_mat, 1, function(x) if (all(is.na(x))) NA_real_ else max(x, na.rm = TRUE))
+query$hlca_maxprob <- maxp
+query$hlca_uncertainty <- 1 - query$hlca_maxprob
+entropy <- function(p) {
+  p <- p[!is.na(p)]
+  if (length(p) == 0) return(NA_real_)
+  p <- p / (sum(p) + 1e-12)
+  -sum(p * log(p + 1e-12))
+}
+query$hlca_entropy <- apply(score_mat, 1, entropy)
+
+# =========================
+# Key label sets and sample-level summaries
+# =========================
+spp1_mdm_labels <- c("Monocyte derived Mph", "Alveolar Mph CCL3+")
+cthrc1_fib_labels <- c("Myofibroblasts", "Subpleural fibroblasts")
+krt17_pats_epi_labels <- c("AT0")
+fabp4_mph_labels <- c("Alveolar macrophages")
+
+query$SPP1_MDM_flag   <- query$hlca_label %in% spp1_mdm_labels
+query$CTHRC1_FIB_flag <- query$hlca_label %in% cthrc1_fib_labels
+query$krt17_pats_epi_flag <- query$hlca_label %in% krt17_pats_epi_labels
+query$fabp4_mph_flag  <- query$hlca_label %in% fabp4_mph_labels
+
+# Ensure meta fields exist (edit names if your object differs)
+if (!("orig.ident" %in% colnames(query@meta.data))) {
+  stop("Field 'orig.ident' not found in meta; please add or rename accordingly.")
+}
+# group1 is used below; if you only have 'group', adapt here:
+if (!("group1" %in% colnames(query@meta.data))) {
+  stop("Field 'group1' not found in meta; please add or rename (e.g., Survivor/NonSurvivor).")
+}
+
+per_sample <- query@meta.data %>%
+  group_by(orig.ident, group1) %>%
+  summarise(
+    n = n(),
+    prop_SPP1_MDM   = mean(SPP1_MDM_flag, na.rm = TRUE),
+    prop_CTHRC1_FIB = mean(CTHRC1_FIB_flag, na.rm = TRUE),
+    prop_krt17_pats_epi = mean(krt17_pats_epi_flag, na.rm = TRUE),
+    prop_fabp4_mph  = mean(fabp4_mph_flag, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+dir.create("results/hlca_mapping/figures", recursive = TRUE, showWarnings = FALSE)
+dir.create("results/hlca_mapping/tables", recursive = TRUE, showWarnings = FALSE)
+write.csv(per_sample, "results/hlca_mapping/tables/per_sample_label_prop.csv", row.names = FALSE)
+
+p1 <- ggboxplot(per_sample, x = "group1", y = "prop_SPP1_MDM", add = "jitter", color = "group1") +
+  stat_compare_means(method = "wilcox.test") +
+  ylab("Proportion of SPP1+ MDM (per sample)") + xlab("")
+ggsave("results/hlca_mapping/figures/prop_SPP1_MDM_by_group.pdf", p1, width = 4, height = 3, dpi = 300)
+
+p2 <- ggboxplot(per_sample, x = "group1", y = "prop_CTHRC1_FIB", add = "jitter", color = "group1") +
+  stat_compare_means(method = "wilcox.test") +
+  ylab("Proportion of CTHRC1+ fibroblasts (per sample)") + xlab("")
+ggsave("results/hlca_mapping/figures/prop_CTHRC1_FIB_by_group.pdf", p2, width = 4, height = 3, dpi = 300)
+
+p3 <- ggboxplot(per_sample, x = "group1", y = "prop_krt17_pats_epi", add = "jitter", color = "group1") +
+  stat_compare_means(method = "wilcox.test") +
+  ylab("Proportion of KRT17/PATS epithelial (per sample)") + xlab("")
+ggsave("results/hlca_mapping/figures/prop_krt17_pats_epi_by_group.pdf", p3, width = 4, height = 3, dpi = 300)
+
+p4 <- ggboxplot(per_sample, x = "group1", y = "prop_fabp4_mph", add = "jitter", color = "group1") +
+  stat_compare_means(method = "wilcox.test") +
+  ylab("Proportion of FABP4+ macrophages (per sample)") + xlab("")
+ggsave("results/hlca_mapping/figures/prop_fabp4_mph_by_group.pdf", p4, width = 4, height = 3, dpi = 300)
+
+# Uncertainty violin by group
+df_unc <- query@meta.data %>% select(group1, hlca_uncertainty)
+p_violin <- ggplot(df_unc, aes(x = group1, y = hlca_uncertainty, fill = group1)) +
+  geom_violin(trim = TRUE) +
+  geom_boxplot(width = 0.1, outlier.size = 0.3, color = "black") +
+  theme_minimal() + ylab("Uncertainty (1 - maxprob)") + xlab("")
+ggsave("results/hlca_mapping/figures/uncertainty_violin.pdf", p_violin, width = 4, height = 3, dpi = 300)
+
+# =========================
+# Module scores and UMAP/DotPlot
+# =========================
+DefaultAssay(query) <- "RNA"
+query <- NormalizeData(query, assay = "RNA")
+MDM_SPP1 <- c("SPP1","CHI3L1","PLA2G7","MMP9","APOE")
+Alveolar_Fib <- c("ALDH1A1","PDGFRA","NPNT","COL15A1")
+CTHRC1_Fib <- c("CTHRC1","COL1A1","COL3A1","THBS2","FN1")
+krt17_pats_epi <- c("KRT17","SFTPC","SFTPA1","SFTPB","LAMP3","ABCA3","HOPX","PDPN","AGER","MKI67","EPCAM","CLDN4")
+FABP4_AM <- c("FABP4","PPARG","MARCO","LPL","C1QA")
+
+# AddModuleScore will create columns with "1" suffix
+query <- AddModuleScore(query, features = list(MDM_SPP1), name = "Score_MDM_SPP1")
+query <- AddModuleScore(query, features = list(CTHRC1_Fib), name = "Score_CTHRC1_Fib")
+query <- AddModuleScore(query, features = list(Alveolar_Fib), name = "Score_Alveolar_Fib")
+query <- AddModuleScore(query, features = list(FABP4_AM), name = "Score_FABP4_AM")
+query <- AddModuleScore(query, features = list(krt17_pats_epi), name = "Score_krt17_pats_epi")
+
+score_features <- c("Score_CTHRC1_Fib1","Score_Alveolar_Fib1","Score_FABP4_AM1","Score_krt17_pats_epi1","Score_MDM_SPP11")
+missing_cols <- setdiff(score_features, colnames(query@meta.data))
+if (length(missing_cols) > 0) {
+  stop(paste("Missing module score columns:", paste(missing_cols, collapse = ", ")))
+}
+
+# UMAP FeaturePlots for module scores
+plot_feat_umap <- function(obj, feature) {
+  FeaturePlot(obj, features = feature, reduction = "proj.umap", cols = c("blue","yellow","red")) +
+    ggtitle(feature) + theme(aspect.ratio = 1, plot.title = element_text(size = 12, face = "bold"))
+}
+umap_plots <- lapply(score_features, function(f) plot_feat_umap(query, f))
+umap_grid <- cowplot::plot_grid(plotlist = umap_plots, ncol = 3)
+ggsave("results/hlca_mapping/figures/UMAP_Module_Scores.pdf", umap_grid, width = 12, height = 8)
+
+# Create SCORE assay for DotPlot
+make_score_assay <- function(obj, score_cols, assay_name = "SCORE"){
+  mat <- t(as.matrix(obj@meta.data[, score_cols, drop = FALSE]))
+  score_assay <- SeuratObject::CreateAssayObject(data = mat)
+  obj[[assay_name]] <- score_assay
+  obj
+}
+query <- make_score_assay(query, score_features, assay_name = "SCORE")
+DefaultAssay(query) <- "SCORE"
+
+plot_dot_by_ident <- function(obj, score_feats, group_var, scale = TRUE) {
+  Idents(obj) <- obj@meta.data[[group_var]]
+  DotPlot(obj, features = score_feats, cols = c("white","red"), scale = scale) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    labs(x = "Score", y = group_var, color = "Avg Exp", size = "Pct Exp") +
+    ggtitle(paste0("Module Scores by ", group_var))
+}
+p_dot_hlca <- plot_dot_by_ident(query, score_features, group_var = "hlca_label", scale = TRUE)
+ggsave("results/hlca_mapping/figures/DotPlot_Scores_by_hlca_label.pdf", p_dot_hlca, width = 7.2, height = 11.1)
+if ("celltype2" %in% colnames(query@meta.data)) {
+  p_dot_celltype2 <- plot_dot_by_ident(query, score_features, group_var = "celltype2", scale = TRUE)
+  ggsave("results/hlca_mapping/figures/DotPlot_Scores_by_celltype2.pdf", p_dot_celltype2, width = 7.2, height = 11.1)
+}
+DefaultAssay(query) <- "RNA"
+
+# =========================
+# Marker heatmap by HLCA labels
+# =========================
+markers <- list(
+  AM_resident = c("PPARG","FABP4","MARCO","LPL","CSF2RB"),
+  MDM_SPP1    = c("SPP1","CHI3L1","PLA2G7","MMP9","APOE"),
+  Alveolar_Fib = c("ALDH1A1","PDGFRA","NPNT","COL15A1"),
+  CTHRC1_Fib  = c("CTHRC1","COL1A1","COL3A1","THBS2","FN1"),
+  krt17_pats_epi = c("KRT17","SFTPC","SFTPA1","SFTPB","LAMP3","ABCA3","HOPX","PDPN","AGER","MKI67","EPCAM","CLDN4")
+)
+all_markers <- unique(intersect(unlist(markers), rownames(query)))
+DefaultAssay(query) <- "RNA"
+query <- NormalizeData(query, assay = "RNA")
+Idents(query) <- factor(query$hlca_label)
+if (length(all_markers) >= 3) {
+  avg <- AverageExpression(query, features = all_markers, assays = "RNA", slot = "data")$RNA
+  avg_matrix <- as.matrix(avg)
+  avg_matrix[is.na(avg_matrix)] <- 0
+  avg_matrix[is.infinite(avg_matrix)] <- 0
+  row_variances <- apply(avg_matrix, 1, var)
+  genes_with_variance <- names(row_variances[row_variances > 0])
+  if (length(genes_with_variance) > 1) {
+    avg_z <- t(scale(t(avg_matrix[genes_with_variance, ])))
+    avg_z[is.na(avg_z)] <- 0
+    avg_z[is.infinite(avg_z)] <- 0
+    pheatmap(
+      avg_z,
+      color = colorRampPalette(c("navy","white","firebrick3"))(101),
+      filename = "results/hlca_mapping/figures/marker_heatmap_hlca_labels.pdf",
+      width = 10, height = 8
+    )
+  } else {
+    warning("Too few variable markers for heatmap clustering.")
+  }
+} else {
+  warning("Fewer than 3 markers found; heatmap skipped.")
+}
+
+# =========================
+# Proportion tables and uncertainty summaries
+# =========================
+if (!("group" %in% colnames(query@meta.data))) {
+  # If you only have group1 in meta, create 'group' alias for downstream exports
+  query$group <- query$group1
+}
+label_prop <- query@meta.data %>%
+  count(group, hlca_label, name = "n") %>%
+  group_by(group) %>% mutate(prop = n/sum(n)) %>% ungroup()
+write.csv(label_prop, "results/hlca_mapping/label_proportions_by_group.csv", row.names = FALSE)
+
+uncert_summary <- query@meta.data %>%
+  group_by(group, hlca_label) %>%
+  summarise(
+    median = median(hlca_uncertainty, na.rm = TRUE),
+    mean   = mean(hlca_uncertainty, na.rm = TRUE),
+    sd     = sd(hlca_uncertainty, na.rm = TRUE),
+    n      = n(),
+    .groups = "drop"
+  )
+write.csv(uncert_summary, "results/hlca_mapping/uncertainty_by_label_group.csv", row.names = FALSE)
+
+# By celltype2 (if available)
+if ("celltype2" %in% colnames(query@meta.data)) {
+  query$hlca_label <- as.factor(query$hlca_label)
+  query$celltype2 <- as.factor(query$celltype2)
+  md <- query@meta.data %>%
+    tibble::rownames_to_column("cell") %>%
+    transmute(cell, celltype2 = as.character(celltype2), hlca_label = as.character(hlca_label)) %>%
+    filter(!is.na(celltype2), !is.na(hlca_label))
+  label_prop_ct2 <- md %>%
+    count(celltype2, hlca_label, name = "n") %>%
+    group_by(celltype2) %>% mutate(prop = n / sum(n)) %>% ungroup()
+  write.csv(label_prop_ct2, "results/hlca_mapping/tables/label_proportions_by_celltype2.csv", row.names = FALSE)
+  
+  uncert_summary_ct2 <- query@meta.data %>%
+    group_by(celltype2, hlca_label) %>%
+    summarise(median = median(hlca_uncertainty, na.rm = TRUE),
+              mean   = mean(hlca_uncertainty, na.rm = TRUE),
+              sd     = sd(hlca_uncertainty, na.rm = TRUE),
+              n      = n(), .groups = "drop")
+  write.csv(uncert_summary_ct2, "results/hlca_mapping/tables/uncertainty_by_label_celltype2.csv", row.names = FALSE)
+  
+  # Example stacked bar plots
+  ggplot(label_prop_ct2, aes(x = celltype2, y = prop, fill = hlca_label)) +
+    geom_bar(stat = "identity", position = "fill") +
+    labs(title = "HLCA label distribution by cell type", x = "Cell type", y = "Proportion", fill = "HLCA label") +
+    theme_minimal() + theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    scale_y_continuous(labels = scales::percent)
+  
+  ggplot(label_prop_ct2, aes(x = hlca_label, y = prop, fill = celltype2)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    labs(title = "Proportion of HLCA labels across cell types", x = "HLCA label", y = "Proportion", fill = "Cell type") +
+    theme_minimal() + theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    scale_y_continuous(labels = scales::percent)
+  
+  # Uncertainty bars
+  uncert_summary_ct2$sem <- uncert_summary_ct2$sd / sqrt(pmax(uncert_summary_ct2$n, 1))
+  ggplot(uncert_summary_ct2, aes(x = hlca_label, y = mean, fill = celltype2)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    geom_errorbar(aes(ymin = mean - sem, ymax = mean + sem), position = position_dodge(0.9), width = 0.2) +
+    labs(title = "Mean uncertainty of HLCA labels with SEM", x = "HLCA label", y = "Mean uncertainty", fill = "Cell type") +
+    theme_minimal() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+
+# =========================
+# Additional modules and subset analyses (macrophages/fibroblasts)
+# =========================
+present <- function(g) intersect(g, rownames(query))
+AM_resident_genes <- c("PPARG","FABP4","MARCO","LPL")
+MDM_fibrotic_genes <- c("SPP1","CHI3L1","PLA2G7","MMP9","APOE")
+Fib_alveolar_genes <- c("ALDH1A1","PDGFRA","NPNT","COL15A1")
+Fib_adipocyte_like_genes <- c("PLIN2","ADIPOQ","PPARG","FABP4","LPL")  # Example; adapt to HLCA panel
+Fib_CTHRC1_pathologic_genes <- c("CTHRC1","COL1A1","SERPINE1","HIF1A","THBS2","FN1","COL3A1")
+modules <- list(
+  AM_resident = present(AM_resident_genes),
+  MDM_fibrotic = present(MDM_fibrotic_genes),
+  Fib_alveolar = present(Fib_alveolar_genes),
+  Fib_adipocyte_like = present(Fib_adipocyte_like_genes),
+  Fib_pathologic_CTHRC1 = present(Fib_CTHRC1_pathologic_genes)
+)
+score_modules <- function(obj, module_list, prefix = "Score"){
+  for (nm in names(module_list)) {
+    if (length(module_list[[nm]]) >= 3) {
+      obj <- AddModuleScore(obj, features = list(module_list[[nm]]), name = paste0(prefix, "", nm))
+      old <- paste0(prefix, "", nm, "1"); new <- paste0(prefix, "_", nm)
+      if (old %in% colnames(obj@meta.data)) colnames(obj@meta.data)[colnames(obj@meta.data) == old] <- new
+    }
+  }
+  obj
+}
+query <- score_modules(query, modules)
+
+macros <- query[, grepl("Macrophage|Mph|Mono", query$hlca_label, ignore.case = TRUE) |
+                      ("celltype2" %in% colnames(query@meta.data) && grepl("macrophage|mono", query$celltype2, ignore.case = TRUE))]
+fibros <- query[, grepl("fibro", query$hlca_label, ignore.case = TRUE) |
+                     ("celltype2" %in% colnames(query@meta.data) && grepl("fibro", query$celltype2, ignore.case = TRUE))]
+
+score_cols_mac <- intersect(c("Score_AM_resident","Score_MDM_fibrotic"), colnames(query@meta.data))
+score_cols_fib <- intersect(c("Score_Fib_alveolar","Score_Fib_adipocyte_like","Score_Fib_pathologic_CTHRC1"), colnames(query@meta.data))
+
+summarise_sample_scores <- function(sobj, score_cols){
+  sobj@meta.data %>%
+    dplyr::select(orig.ident, group1, dplyr::all_of(score_cols)) %>%
+    dplyr::group_by(orig.ident, group1) %>%
+    dplyr::summarise(dplyr::across(dplyr::all_of(score_cols), ~mean(.x, na.rm = TRUE)), .groups = "drop")
+}
+mac_sample <- summarise_sample_scores(macros, score_cols_mac)
+fib_sample <- summarise_sample_scores(fibros, score_cols_fib)
+
+# Spearman/Kruskal-Dunn helpers
+library(rstatix)
+do_trend_tests <- function(df, score_cols){
+  sp <- purrr::map_dfr(score_cols, function(sc){
+    d <- df[!is.na(df[[sc]]) & !is.na(df$group1), ]
+    if (nrow(d) < 5) return(tibble::tibble(feature = sc, rho = NA_real_, p = NA_real_, n = nrow(d)))
+    ct <- suppressWarnings(cor.test(d[[sc]], as.numeric(factor(d$group1)), method = "spearman", exact = FALSE))
+    tibble::tibble(feature = sc, rho = unname(ct$estimate), p = ct$p.value, n = nrow(d))
+  }) %>% dplyr::mutate(p.adj = p.adjust(p, method = "BH"))
+  kwd <- purrr::map_dfr(score_cols, function(sc){
+    d1 <- df %>% dplyr::select(group1, !!rlang::sym(sc)) %>% dplyr::rename(score = !!rlang::sym(sc)) %>% dplyr::filter(!is.na(score))
+    if (dplyr::n_distinct(d1$group1) < 2) return(tibble::tibble(feature = sc, test = "Kruskal", p = NA_real_))
+    kw <- rstatix::kruskal_test(d1, score ~ group1) %>% dplyr::mutate(feature = sc, test = "Kruskal")
+    dn <- rstatix::dunn_test(d1, score ~ group1, p.adjust.method = "BH") %>% dplyr::mutate(feature = sc, test = "Dunn")
+    dplyr::bind_rows(kw, dn)
+  })
+  list(spearman = sp, kw_dunn = kwd)
+}
+
+plot_box <- function(df, feature, ylab = feature, fname = NULL){
+  p <- ggplot2::ggplot(df, ggplot2::aes(x = group1, y = .data[[feature]], fill = group1)) +
+    ggplot2::geom_boxplot(outlier.shape = NA, alpha = 0.6) +
+    ggplot2::geom_jitter(width = 0.15, size = 1.8, alpha = 0.8) +
+    ggplot2::theme_bw(base_size = 12) + ggplot2::theme(legend.position = "none") +
+    ggplot2::labs(x = "Group", y = ylab, title = paste0(feature, " by group"))
+  if (!is.null(fname)) ggsave(fname, p, width = 5, height = 4, dpi = 300)
+  p
+}
+
+mac_tests <- do_trend_tests(mac_sample, score_cols_mac)
+fib_tests <- do_trend_tests(fib_sample, score_cols_fib)
+dir.create("results/hlca_mapping/figures", recursive = TRUE, showWarnings = FALSE)
+plot_box(mac_sample, "Score_AM_resident", "AM resident score", "results/hlca_mapping/figures/AM_resident_by_group.pdf")
+plot_box(mac_sample, "Score_MDM_fibrotic", "MDM fibrotic score", "results/hlca_mapping/figures/MDM_fibrotic_by_group.pdf")
+plot_box(fib_sample, "Score_Fib_alveolar", "Alveolar fibro score", "results/hlca_mapping/figures/Fib_alveolar_by_group.pdf")
+plot_box(fib_sample, "Score_Fib_adipocyte_like", "Adipocyte-like fibro score", "results/hlca_mapping/figures/Fib_adipocyte_like_by_group.pdf")
+plot_box(fib_sample, "Score_Fib_pathologic_CTHRC1", "CTHRC1+ fibro score", "results/hlca_mapping/figures/Fib_CTHRC1_by_group.pdf")
+
+readr::write_csv(mac_sample, "results/hlca_mapping/tables/macrophage_sample_scores.csv")
+readr::write_csv(fib_sample, "results/hlca_mapping/tables/fibro_sample_scores.csv")
+readr::write_csv(mac_tests$spearman, "results/hlca_mapping/tables/macrophage_spearman.csv")
+readr::write_csv(mac_tests$kw_dunn, "results/hlca_mapping/tables/macrophage_kw_dunn.csv")
+readr::write_csv(fib_tests$spearman, "results/hlca_mapping/tables/fibro_spearman.csv")
+readr::write_csv(fib_tests$kw_dunn, "results/hlca_mapping/tables/fibro_kw_dunn.csv")
+
+# =========================
+# Save final Seurat object
+# =========================
+saveRDS(query, "hlca_azimuth_mapped_query.rds")
